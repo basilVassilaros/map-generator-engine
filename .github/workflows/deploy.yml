@@ -1,0 +1,87 @@
+# Tests, builds and publishes the World Map Generator to GitHub Pages on every
+# push to main. Pull requests run the same checks without publishing.
+#
+# One-time setup on GitHub: Settings → Pages → Source: GitHub Actions.
+
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # Lets you rerun a deploy by hand from the Actions tab.
+
+permissions:
+  contents: read
+
+# Only one deploy at a time; a newer push cancels a deploy still waiting.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7
+
+      - name: Install Rust with the WebAssembly target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Reuse compiled Rust from earlier runs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Run the terrain core tests
+        working-directory: core
+        run: cargo test --release
+
+      - name: Install the build tools
+        working-directory: web
+        run: npm ci
+
+      - name: Type-check the interface
+        working-directory: web
+        run: npm run check
+
+      - name: Build the app
+        working-directory: web
+        run: npm run build
+
+      - name: Package the site for Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  deploy:
+    name: Publish to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Publish
+        id: deployment
+        uses: actions/deploy-pages@v5

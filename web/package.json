@@ -1,0 +1,17 @@
+{
+  "name": "world-map-generator-web",
+  "version": "1.0.0",
+  "description": "Browser interface for the world map generator",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit",
+    "bench": "node scripts/bench.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.10",
+    "typescript": "^5.9.3"
+  },
+  "private": true,
+  "type": "module",
+  "license": "MIT OR Apache-2.0"
+}

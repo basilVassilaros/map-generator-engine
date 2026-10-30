@@ -16,7 +16,11 @@ interface ClaudeRuntime {
 export async function exportPng(canvas: HTMLCanvasElement, filename: string): Promise<string> {
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
   if (!blob) return "The image couldn't be created. Try a lower working resolution.";
+  return saveBlob(blob, filename);
+}
 
+/** Save a finished file. Returns a short status line for the interface. */
+export async function saveBlob(blob: Blob, filename: string): Promise<string> {
   const runtime = (window as unknown as { claude?: ClaudeRuntime }).claude;
   if (runtime?.use) {
     const downloads = await runtime.use("downloads");
@@ -28,6 +32,7 @@ export async function exportPng(canvas: HTMLCanvasElement, filename: string): Pr
       const code = (err as { code?: string }).code;
       if (code === "declined") return "Export cancelled.";
       if (code === "rate_limited") return "A save is already waiting for confirmation.";
+      if (code === "too_large") return "That image is too large to save here. Try a smaller size.";
       return "Downloads aren't available in this view.";
     }
   }

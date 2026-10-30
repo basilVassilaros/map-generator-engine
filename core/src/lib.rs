@@ -11,5 +11,5 @@ pub mod render;
 #[cfg(target_arch = "wasm32")]
 mod ffi;
 
-pub use coast::{Coastline, SegmentParams};
+pub use coast::{Coastline, Frame, SegmentParams, Shape};
 pub use engine::{Engine, Rect};

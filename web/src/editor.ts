@@ -1,49 +1,134 @@
-// The coastline pen: placing, closing, dragging, inserting and deleting
-// points, selecting segments, and drawing the guide overlay.
+// The coastline pen and shape editing: drawing new shapes point by point,
+// selecting shapes, segments and points, dragging points, inserting and
+// deleting them, moving, resizing and rotating whole shapes, and drawing the
+// guide overlay. Pan and zoom gestures are passed to the app.
 
-import { DEFAULT_PARAMS, type CoastGuide, type SegmentParams, type Vec2 } from "./protocol";
+import { DEFAULT_VALUES, NO_ADJUSTMENT, effective, toParams, type SliderValues } from "./params";
+import type { Guides, Vec2 } from "./protocol";
 
-export type Selection = { kind: "segment"; index: number } | { kind: "point"; index: number } | null;
-
-export interface CoastModel {
-  points: Vec2[];
-  params: SegmentParams[];
-  seed: number;
-  closed: boolean;
+export interface ShapeFrame {
+  x: number;
+  y: number;
+  angle: number;
+  /** 1 when drawn; resizing multiplies it, so the coastline detail scales too. */
+  scale: number;
 }
 
-/** What changed, so the app knows whether to regenerate. */
-export type EditKind = "shape" | "selection" | "view";
+export interface ShapeModel {
+  id: number;
+  name: string;
+  kind: "land" | "water";
+  points: Vec2[];
+  /** Coastline slider values for the whole shape. */
+  base: SliderValues;
+  /** Each segment's own adjustment on top of `base`. adjust[i] belongs to the segment from points[i] to points[i + 1]. */
+  adjust: SliderValues[];
+  seed: number;
+  /** Anchors the coastline detail, so it travels with the shape. */
+  frame: ShapeFrame;
+  hidden: boolean;
+  locked: boolean;
+}
+
+export type Selection =
+  | { kind: "shape"; shape: number }
+  | { kind: "segment"; shape: number; index: number }
+  | { kind: "point"; shape: number; index: number }
+  | null;
+
+/** What changed: terrain ("shape"), only the selection, or only the shape list. */
+export type EditKind = "shape" | "selection" | "list";
+
+type Corner = 0 | 1 | 2 | 3; // top-left, top-right, bottom-right, bottom-left
+
+type Drag =
+  | { kind: "point"; shape: number; index: number }
+  | { kind: "pan"; x: number; y: number; moved: boolean; onClick: "deselect" | "undo-point" | "none" }
+  | {
+      kind: "transform";
+      mode: "move" | "rotate" | { corner: Corner };
+      shape: number;
+      start: Vec2;
+      points: Vec2[];
+      frame: ShapeFrame;
+      box: Box;
+      moved: boolean;
+    };
+
+interface Box {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
 
 const POINT_HIT_PX = 10;
 const SEGMENT_HIT_PX = 8;
+const HANDLE_HIT_PX = 9;
+const ROTATE_OFFSET_PX = 26;
+const DRAG_THRESHOLD_PX = 4;
+
+const GUIDE = "#ffffff";
+const WATER_GUIDE = "#8fdcff";
+const HIGHLIGHT = "#f2b01e";
+const HALO = "rgba(10, 20, 28, 0.45)";
 
 export function newSeed(): number {
-  // The core reads the seed as a 32-bit float, so keep it exactly representable.
+  // The core reads seeds as 32-bit floats, so keep them exactly representable.
   return Math.floor(Math.random() * 0xffffff);
 }
 
-export function toGuide(model: CoastModel): CoastGuide | null {
-  if (!model.closed) return null;
-  return { points: model.points, params: model.params, seed: model.seed };
+function boundingBox(points: Vec2[]): Box {
+  const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+  for (const p of points) {
+    box.x0 = Math.min(box.x0, p.x);
+    box.y0 = Math.min(box.y0, p.y);
+    box.x1 = Math.max(box.x1, p.x);
+    box.y1 = Math.max(box.y1, p.y);
+  }
+  return box;
+}
+
+function insidePolygon(p: Vec2, pts: Vec2[]): boolean {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const a = pts[i];
+    const b = pts[j];
+    if (a.y > p.y !== b.y > p.y && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+function boxCorners(b: Box): Vec2[] {
+  return [
+    { x: b.x0, y: b.y0 },
+    { x: b.x1, y: b.y0 },
+    { x: b.x1, y: b.y1 },
+    { x: b.x0, y: b.y1 },
+  ];
 }
 
 export class CoastEditor {
-  model: CoastModel = { points: [], params: [], seed: newSeed(), closed: false };
+  shapes: ShapeModel[] = [];
+  /** Points of the shape being drawn, or null when not drawing. */
+  draft: Vec2[] | null = [];
   selection: Selection = null;
+  readonly worldSeed = newSeed();
   onEdit: (kind: EditKind) => void = () => {};
   /** Drag to pan, in CSS pixels. */
   onPan: (dx: number, dy: number) => void = () => {};
   /** Zoom by `factor`, keeping the point under (x, y) in place (CSS pixels on the overlay). */
   onZoom: (factor: number, x: number, y: number) => void = () => {};
 
+  private nextId = 1;
+  private nextNumber = 1;
   private extentKm: number;
   private view = { left: 0, top: 0, size: 1 };
   private cursor: Vec2 | null = null;
   private hover: Selection = null;
-  private dragging: number | null = null;
-  private panning: { x: number; y: number; moved: boolean; clickDeselects: boolean } | null = null;
+  private drag: Drag | null = null;
   private spaceHeld = false;
+  private shiftHeld = false;
   private ctx: CanvasRenderingContext2D;
 
   constructor(private overlay: HTMLCanvasElement, extentKm: number) {
@@ -52,6 +137,7 @@ export class CoastEditor {
     overlay.addEventListener("pointerdown", (e) => this.pointerDown(e));
     overlay.addEventListener("pointermove", (e) => this.pointerMove(e));
     overlay.addEventListener("pointerup", (e) => this.pointerUp(e));
+    overlay.addEventListener("pointercancel", (e) => this.pointerUp(e));
     overlay.addEventListener("pointerleave", () => {
       this.cursor = null;
       this.hover = null;
@@ -62,12 +148,193 @@ export class CoastEditor {
     overlay.addEventListener("wheel", (e) => this.wheel(e), { passive: false });
     window.addEventListener("keydown", (e) => this.key(e));
     window.addEventListener("keyup", (e) => {
-      if (e.key === " ") {
-        this.spaceHeld = false;
-        this.overlay.style.cursor = this.cursorStyle();
-      }
+      if (e.key === " ") this.spaceHeld = false;
+      if (e.key === "Shift") this.shiftHeld = false;
+      this.overlay.style.cursor = this.cursorStyle();
     });
   }
+
+  // --- the model, as seen by the app -----------------------------------------------
+
+  get drawing(): boolean {
+    return this.draft !== null;
+  }
+
+  shape(id: number): ShapeModel | undefined {
+    return this.shapes.find((s) => s.id === id);
+  }
+
+  selectedShape(): ShapeModel | undefined {
+    return this.selection ? this.shape(this.selection.shape) : undefined;
+  }
+
+  /** Edge smoothing (pixels), set by the app and passed through to the core. */
+  smoothingPx = 1;
+
+  /**
+   * What the terrain engine needs: every visible shape, outermost first.
+   * Shapes apply in order (land adds, water cuts out), so nesting decides the
+   * result: a lake inside a continent comes after it and cuts into it, and an
+   * island inside that lake comes after the lake and adds land back.
+   */
+  guides(): Guides {
+    const visible = this.shapes.filter((s) => !s.hidden);
+    const area = (s: ShapeModel) => {
+      const b = boundingBox(s.points);
+      return (b.x1 - b.x0) * (b.y1 - b.y0);
+    };
+    const depth = new Map<number, number>();
+    for (const s of visible) {
+      const b = boundingBox(s.points);
+      const centre = { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2 };
+      const inside = insidePolygon(centre, s.points) ? centre : s.points[0];
+      depth.set(s.id, visible.filter((t) => t !== s && area(t) > area(s) && insidePolygon(inside, t.points)).length);
+    }
+    const ordered = visible
+      .map((s, i) => ({ s, i }))
+      .sort((a, b) => depth.get(a.s.id)! - depth.get(b.s.id)! || a.i - b.i)
+      .map(({ s }) => s);
+    return {
+      worldSeed: this.worldSeed,
+      smoothingPx: this.smoothingPx,
+      shapes: ordered.map((s) => ({
+        id: s.id,
+        seed: s.seed,
+        frame: s.frame,
+        water: s.kind === "water",
+        points: s.points,
+        params: s.adjust.map((a) => toParams(effective(s.base, a))),
+      })),
+    };
+  }
+
+  // --- commands from the panel ------------------------------------------------------
+
+  /** Start drawing a new shape. */
+  newShape(): void {
+    this.draft = [];
+    this.selection = null;
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  /** Stop drawing without keeping the unfinished shape. */
+  cancelDraft(): void {
+    if (!this.draft) return;
+    this.draft = this.shapes.length ? null : [];
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  select(selection: Selection): void {
+    if (this.draft && this.shapes.length) this.draft = null;
+    this.selection = selection;
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  rename(id: number, name: string): void {
+    const s = this.shape(id);
+    if (!s) return;
+    s.name = name.trim() || s.name;
+    this.onEdit("list");
+  }
+
+  /** Make a shape land or water. Default names follow the kind. */
+  setKind(id: number, kind: "land" | "water"): void {
+    const s = this.shape(id);
+    if (!s || s.locked || s.kind === kind) return;
+    s.kind = kind;
+    const match = /^(Landmass|Lake) (\d+)$/.exec(s.name);
+    if (match) s.name = `${kind === "water" ? "Lake" : "Landmass"} ${match[2]}`;
+    this.onEdit("shape");
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  toggleHidden(id: number): void {
+    const s = this.shape(id);
+    if (!s) return;
+    s.hidden = !s.hidden;
+    if (s.hidden && this.selection?.shape === id) this.selection = null;
+    this.onEdit("shape");
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  toggleLocked(id: number): void {
+    const s = this.shape(id);
+    if (!s) return;
+    s.locked = !s.locked;
+    if (s.locked && this.selection?.shape === id) this.selection = { kind: "shape", shape: id };
+    this.onEdit("list");
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  deleteShape(id: number): void {
+    this.shapes = this.shapes.filter((s) => s.id !== id);
+    if (this.selection?.shape === id) this.selection = null;
+    if (!this.shapes.length) this.draft = [];
+    this.onEdit("shape");
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  clearAll(): void {
+    this.shapes = [];
+    this.draft = [];
+    this.selection = null;
+    this.onEdit("shape");
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  /** The slider values a segment actually uses: its shape's plus its own adjustment. */
+  segmentValues(shape: ShapeModel, index: number): SliderValues {
+    return effective(shape.base, shape.adjust[index]);
+  }
+
+  /** Change the whole shape's values. Every segment keeps its own adjustment on top. */
+  setShapeValues(values: SliderValues): void {
+    const s = this.selectedShape();
+    if (!s || s.locked) return;
+    s.base = { ...values };
+    this.onEdit("shape");
+  }
+
+  /** Set a segment's values; stored as its adjustment from the shape's values. */
+  setSegmentValues(index: number, values: SliderValues): void {
+    const s = this.selectedShape();
+    if (!s || s.locked) return;
+    const adjust = {} as SliderValues;
+    for (const k of Object.keys(values) as (keyof SliderValues)[]) adjust[k] = values[k] - s.base[k];
+    s.adjust[index] = adjust;
+    this.onEdit("shape");
+  }
+
+  /** Remove a segment's own adjustment, so it follows its shape exactly. */
+  resetSegment(index: number): void {
+    const s = this.selectedShape();
+    if (!s || s.locked) return;
+    s.adjust[index] = { ...NO_ADJUSTMENT };
+    this.onEdit("shape");
+    this.onEdit("selection");
+  }
+
+  deletePoint(index: number): void {
+    const s = this.selectedShape();
+    if (!s || s.locked || s.points.length <= 3) return;
+    s.points.splice(index, 1);
+    // Removing a point merges the segments either side; keep the earlier one.
+    s.adjust.splice(index, 1);
+    this.selection = { kind: "shape", shape: s.id };
+    this.onEdit("shape");
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  // --- coordinates ------------------------------------------------------------------
 
   /** Where the map square sits on the overlay, in CSS pixels. */
   setView(left: number, top: number, size: number): void {
@@ -75,37 +342,7 @@ export class CoastEditor {
     this.draw();
   }
 
-  clear(): void {
-    this.model = { points: [], params: [], seed: newSeed(), closed: false };
-    this.selection = null;
-    this.onEdit("shape");
-    this.draw();
-  }
-
-  setParams(index: number, params: SegmentParams): void {
-    this.model.params[index] = { ...params };
-    this.onEdit("shape");
-  }
-
-  applyToAll(params: SegmentParams): void {
-    this.model.params = this.model.points.map(() => ({ ...params }));
-    this.onEdit("shape");
-  }
-
-  deletePoint(index: number): void {
-    const { points, params } = this.model;
-    if (!this.model.closed || points.length <= 3) return;
-    points.splice(index, 1);
-    // Removing a point merges the segments either side; keep the earlier one.
-    params.splice(index, 1);
-    this.selection = null;
-    this.onEdit("shape");
-    this.draw();
-  }
-
-  // --- coordinates ----------------------------------------------------------
-
-  private toKm(e: PointerEvent | MouseEvent): Vec2 {
+  private toKm(e: { clientX: number; clientY: number }): Vec2 {
     const r = this.overlay.getBoundingClientRect();
     const s = this.extentKm / this.view.size;
     return { x: (e.clientX - r.left - this.view.left) * s, y: (e.clientY - r.top - this.view.top) * s };
@@ -124,13 +361,21 @@ export class CoastEditor {
     return p.x >= 0 && p.y >= 0 && p.x <= this.extentKm && p.y <= this.extentKm;
   }
 
-  // --- hit testing ----------------------------------------------------------
+  private clampToMap(p: Vec2): Vec2 {
+    return { x: Math.max(0, Math.min(this.extentKm, p.x)), y: Math.max(0, Math.min(this.extentKm, p.y)) };
+  }
 
-  private hitPoint(p: Vec2): number | null {
-    const limit = POINT_HIT_PX * this.kmPerPx();
+  /** Shapes that can be clicked on the map: visible and not locked, topmost first. */
+  private editable(): ShapeModel[] {
+    return this.shapes.filter((s) => !s.hidden && !s.locked).reverse();
+  }
+
+  // --- hit testing ------------------------------------------------------------------
+
+  private hitPoint(p: Vec2, pts: Vec2[]): number | null {
     let best: number | null = null;
-    let bestDist = limit;
-    this.model.points.forEach((q, i) => {
+    let bestDist = POINT_HIT_PX * this.kmPerPx();
+    pts.forEach((q, i) => {
       const d = Math.hypot(q.x - p.x, q.y - p.y);
       if (d <= bestDist) {
         best = i;
@@ -140,136 +385,306 @@ export class CoastEditor {
     return best;
   }
 
-  private hitSegment(p: Vec2): { index: number; at: Vec2 } | null {
-    if (!this.model.closed) return null;
-    const pts = this.model.points;
-    const limit = SEGMENT_HIT_PX * this.kmPerPx();
-    let best: { index: number; at: Vec2 } | null = null;
-    let bestDist = limit;
-    for (let i = 0; i < pts.length; i++) {
-      const a = pts[i];
-      const b = pts[(i + 1) % pts.length];
-      const abx = b.x - a.x;
-      const aby = b.y - a.y;
-      const len2 = abx * abx + aby * aby || 1;
-      const t = Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2));
-      const at = { x: a.x + abx * t, y: a.y + aby * t };
-      const d = Math.hypot(p.x - at.x, p.y - at.y);
-      if (d <= bestDist) {
-        best = { index: i, at };
-        bestDist = d;
+  private hitSegment(p: Vec2): { shape: ShapeModel; index: number; at: Vec2 } | null {
+    let best: { shape: ShapeModel; index: number; at: Vec2 } | null = null;
+    let bestDist = SEGMENT_HIT_PX * this.kmPerPx();
+    for (const shape of this.editable()) {
+      const pts = shape.points;
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i];
+        const b = pts[(i + 1) % pts.length];
+        const abx = b.x - a.x;
+        const aby = b.y - a.y;
+        const len2 = abx * abx + aby * aby || 1;
+        const t = Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2));
+        const at = { x: a.x + abx * t, y: a.y + aby * t };
+        const d = Math.hypot(p.x - at.x, p.y - at.y);
+        if (d < bestDist) {
+          best = { shape, index: i, at };
+          bestDist = d;
+        }
       }
     }
     return best;
   }
 
-  // --- input ----------------------------------------------------------------
+  private hitFill(p: Vec2): ShapeModel | null {
+    return this.editable().find((s) => insidePolygon(p, s.points)) ?? null;
+  }
 
-  private startPan(e: PointerEvent, clickDeselects: boolean): void {
-    this.panning = { x: e.clientX, y: e.clientY, moved: false, clickDeselects };
+  /** Handles of the whole-shape box, in screen pixels. */
+  private handles(shape: ShapeModel): { box: Box; corners: Vec2[]; rotate: Vec2 } {
+    const b = boundingBox(shape.points);
+    const pad = 6 * this.kmPerPx();
+    const box = { x0: b.x0 - pad, y0: b.y0 - pad, x1: b.x1 + pad, y1: b.y1 + pad };
+    const corners = boxCorners(box).map((c) => this.toPx(c));
+    const top = this.toPx({ x: (box.x0 + box.x1) / 2, y: box.y0 });
+    return { box, corners, rotate: { x: top.x, y: top.y - ROTATE_OFFSET_PX } };
+  }
+
+  private hitHandle(e: PointerEvent | MouseEvent, shape: ShapeModel): "rotate" | Corner | "inside" | null {
+    const r = this.overlay.getBoundingClientRect();
+    const sx = e.clientX - r.left;
+    const sy = e.clientY - r.top;
+    const { box, corners, rotate } = this.handles(shape);
+    if (Math.hypot(sx - rotate.x, sy - rotate.y) <= HANDLE_HIT_PX) return "rotate";
+    for (let i = 0; i < 4; i++) {
+      if (Math.hypot(sx - corners[i].x, sy - corners[i].y) <= HANDLE_HIT_PX) return i as Corner;
+    }
+    const p = this.toKm(e);
+    if (p.x >= box.x0 && p.x <= box.x1 && p.y >= box.y0 && p.y <= box.y1) return "inside";
+    return null;
+  }
+
+  // --- input ------------------------------------------------------------------------
+
+  private startPan(e: PointerEvent, onClick: "deselect" | "undo-point" | "none"): void {
+    this.drag = { kind: "pan", x: e.clientX, y: e.clientY, moved: false, onClick };
     this.overlay.setPointerCapture(e.pointerId);
-    this.overlay.style.cursor = "grabbing";
+  }
+
+  private startTransform(e: PointerEvent, shape: ShapeModel, mode: "move" | "rotate" | { corner: Corner }): void {
+    this.drag = {
+      kind: "transform",
+      mode,
+      shape: shape.id,
+      start: this.toKm(e),
+      points: shape.points.map((p) => ({ ...p })),
+      frame: { ...shape.frame },
+      box: boundingBox(shape.points),
+      moved: false,
+    };
+    this.overlay.setPointerCapture(e.pointerId);
   }
 
   private pointerDown(e: PointerEvent): void {
-    // Middle or right button, or Space plus left button, always pans.
-    if (e.button === 1 || e.button === 2 || (e.button === 0 && this.spaceHeld)) {
+    this.shiftHeld = e.shiftKey;
+    // Middle button, or Space plus left button, always pans. Right button
+    // pans when dragged; a plain right click while drawing removes the last point.
+    if (e.button === 1 || (e.button === 0 && this.spaceHeld)) {
       e.preventDefault();
-      this.startPan(e, false);
+      this.startPan(e, "none");
+      return;
+    }
+    if (e.button === 2) {
+      e.preventDefault();
+      this.startPan(e, this.draft?.length ? "undo-point" : "none");
       return;
     }
     if (e.button !== 0) return;
     const p = this.toKm(e);
-    const { model } = this;
 
-    if (!model.closed) {
-      if (model.points.length >= 3 && this.hitPoint(p) === 0) {
-        model.closed = true;
-        model.params = model.points.map(() => ({ ...DEFAULT_PARAMS }));
-        this.onEdit("shape");
-      } else if (this.onMap(p)) {
-        model.points.push(p);
-        this.onEdit("shape");
+    if (this.draft) {
+      this.drawPoint(p);
+      return;
+    }
+
+    // Handles of a selected whole shape come first.
+    const selected = this.selectedShape();
+    if (selected && this.selection?.kind === "shape" && !selected.locked && !selected.hidden) {
+      const handle = this.hitHandle(e, selected);
+      if (handle === "rotate") return this.startTransform(e, selected, "rotate");
+      if (handle !== null && handle !== "inside") return this.startTransform(e, selected, { corner: handle });
+    }
+
+    // Then points of the selected shape.
+    if (selected && !selected.locked && !selected.hidden) {
+      const index = this.hitPoint(p, selected.points);
+      if (index !== null) {
+        this.selection = { kind: "point", shape: selected.id, index };
+        this.drag = { kind: "point", shape: selected.id, index };
+        this.overlay.setPointerCapture(e.pointerId);
+        this.onEdit("selection");
+        this.draw();
+        return;
       }
+    }
+
+    // Then segments of any shape.
+    const seg = this.hitSegment(p);
+    if (seg) {
+      this.selection = { kind: "segment", shape: seg.shape.id, index: seg.index };
+      this.onEdit("selection");
       this.draw();
       return;
     }
 
-    const point = this.hitPoint(p);
-    if (point !== null) {
-      this.dragging = point;
-      this.selection = { kind: "point", index: point };
-      this.overlay.setPointerCapture(e.pointerId);
-    } else {
-      const seg = this.hitSegment(p);
-      if (!seg) {
-        // Dragging empty map pans; a plain click there clears the selection.
-        this.startPan(e, true);
-        return;
-      }
-      this.selection = { kind: "segment", index: seg.index };
+    // Inside the selected shape's box: drag to move it.
+    if (selected && this.selection?.kind === "shape" && !selected.locked && this.hitHandle(e, selected) === "inside") {
+      this.startTransform(e, selected, "move");
+      return;
     }
-    this.onEdit("selection");
+
+    // A click on a shape's fill selects it as a whole. Dragging an
+    // unselected shape pans instead, so panning never moves land by accident.
+    const fill = this.hitFill(p);
+    if (fill) {
+      this.selection = { kind: "shape", shape: fill.id };
+      this.onEdit("selection");
+      this.draw();
+      this.startPan(e, "none");
+      return;
+    }
+
+    this.startPan(e, "deselect");
+  }
+
+  private drawPoint(p: Vec2): void {
+    const draft = this.draft!;
+    if (draft.length >= 3 && this.hitPoint(p, draft) === 0) {
+      this.closeDraft();
+    } else if (this.onMap(p)) {
+      draft.push(p);
+      this.onEdit("selection");
+    }
     this.draw();
   }
 
+  private closeDraft(): void {
+    const points = this.draft!;
+    const b = boundingBox(points);
+    const shape: ShapeModel = {
+      id: this.nextId++,
+      name: `Landmass ${this.nextNumber++}`,
+      kind: "land",
+      points,
+      base: { ...DEFAULT_VALUES },
+      adjust: points.map(() => ({ ...NO_ADJUSTMENT })),
+      seed: newSeed(),
+      frame: { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2, angle: 0, scale: 1 },
+      hidden: false,
+      locked: false,
+    };
+    this.shapes.push(shape);
+    this.draft = null;
+    this.selection = { kind: "shape", shape: shape.id };
+    this.onEdit("shape");
+    this.onEdit("list");
+    this.onEdit("selection");
+  }
+
   private pointerMove(e: PointerEvent): void {
-    if (this.panning) {
-      const dx = e.clientX - this.panning.x;
-      const dy = e.clientY - this.panning.y;
-      if (!this.panning.moved && Math.hypot(dx, dy) < 4) return;
-      this.panning.moved = true;
-      this.panning.x = e.clientX;
-      this.panning.y = e.clientY;
+    this.shiftHeld = e.shiftKey;
+    const drag = this.drag;
+    if (drag?.kind === "pan") {
+      const dx = e.clientX - drag.x;
+      const dy = e.clientY - drag.y;
+      if (!drag.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+      drag.moved = true;
+      drag.x = e.clientX;
+      drag.y = e.clientY;
       this.onPan(dx, dy);
       return;
     }
     const p = this.toKm(e);
     this.cursor = p;
-    if (this.dragging !== null) {
-      this.model.points[this.dragging] = {
-        x: Math.max(0, Math.min(this.extentKm, p.x)),
-        y: Math.max(0, Math.min(this.extentKm, p.y)),
-      };
-      this.onEdit("shape");
+    if (drag?.kind === "point") {
+      const shape = this.shape(drag.shape);
+      if (shape) {
+        shape.points[drag.index] = this.clampToMap(p);
+        this.onEdit("shape");
+      }
+    } else if (drag?.kind === "transform") {
+      this.transform(drag, p);
     } else {
-      const point = this.hitPoint(p);
-      const seg = point === null ? this.hitSegment(p) : null;
-      this.hover = point !== null ? { kind: "point", index: point } : seg ? { kind: "segment", index: seg.index } : null;
+      this.hover = this.hoverAt(e, p);
     }
-    this.overlay.style.cursor = this.cursorStyle();
+    this.overlay.style.cursor = this.cursorStyle(e);
     this.draw();
   }
 
+  private hoverAt(e: PointerEvent, p: Vec2): Selection {
+    if (this.draft) {
+      return this.draft.length >= 3 && this.hitPoint(p, this.draft) === 0 ? { kind: "point", shape: -1, index: 0 } : null;
+    }
+    const selected = this.selectedShape();
+    if (selected && !selected.locked && !selected.hidden) {
+      const index = this.hitPoint(p, selected.points);
+      if (index !== null) return { kind: "point", shape: selected.id, index };
+    }
+    const seg = this.hitSegment(p);
+    if (seg) return { kind: "segment", shape: seg.shape.id, index: seg.index };
+    const fill = this.hitFill(p);
+    return fill ? { kind: "shape", shape: fill.id } : null;
+  }
+
+  /** Apply a move, resize or rotate drag to the shape, from its starting state. */
+  private transform(drag: Extract<Drag, { kind: "transform" }>, p: Vec2): void {
+    const shape = this.shape(drag.shape);
+    if (!shape) return;
+    const dx = p.x - drag.start.x;
+    const dy = p.y - drag.start.y;
+    if (!drag.moved && Math.hypot(dx, dy) / this.kmPerPx() < DRAG_THRESHOLD_PX) return;
+    drag.moved = true;
+    const b = drag.box;
+
+    if (drag.mode === "move") {
+      // Keep the whole shape on the map.
+      const mx = Math.max(-b.x0, Math.min(this.extentKm - b.x1, dx));
+      const my = Math.max(-b.y0, Math.min(this.extentKm - b.y1, dy));
+      shape.points = drag.points.map((q) => ({ x: q.x + mx, y: q.y + my }));
+      // The frame travels with the shape, so its coastline stays the same.
+      shape.frame = { ...drag.frame, x: drag.frame.x + mx, y: drag.frame.y + my };
+    } else if (drag.mode === "rotate") {
+      const c = { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2 };
+      let angle = Math.atan2(p.y - c.y, p.x - c.x) - Math.atan2(drag.start.y - c.y, drag.start.x - c.x);
+      if (this.shiftHeld) angle = Math.round(angle / (Math.PI / 12)) * (Math.PI / 12); // 15 degree steps
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const turn = (q: Vec2) => ({ x: c.x + (q.x - c.x) * cos - (q.y - c.y) * sin, y: c.y + (q.x - c.x) * sin + (q.y - c.y) * cos });
+      shape.points = drag.points.map((q) => this.clampToMap(turn(q)));
+      // The frame turns too, so the coastline detail turns with the shape.
+      shape.frame = { ...drag.frame, ...turn(drag.frame), angle: drag.frame.angle + angle };
+    } else {
+      // Resize from the opposite corner. Proportional by default, so the
+      // coastline is an exact enlargement or reduction; Shift stretches freely.
+      // The frame scales with the shape, so the coastline detail does too.
+      const corners = boxCorners(b);
+      const corner = drag.mode.corner;
+      const anchor = corners[(corner + 2) % 4];
+      const from = corners[corner];
+      const minKm = 10;
+      let sx = Math.max(minKm / (b.x1 - b.x0 || 1), (p.x - anchor.x) / (from.x - anchor.x || 1));
+      let sy = Math.max(minKm / (b.y1 - b.y0 || 1), (p.y - anchor.y) / (from.y - anchor.y || 1));
+      if (!this.shiftHeld) sx = sy = Math.max(sx, sy);
+      const scale = (q: { x: number; y: number }) => ({ x: anchor.x + (q.x - anchor.x) * sx, y: anchor.y + (q.y - anchor.y) * sy });
+      shape.points = drag.points.map((q) => this.clampToMap(scale(q)));
+      shape.frame = { ...drag.frame, ...scale(drag.frame), scale: drag.frame.scale * Math.sqrt(sx * sy) };
+    }
+    this.onEdit("shape");
+  }
+
   private pointerUp(e: PointerEvent): void {
-    if (this.panning) {
-      const { moved, clickDeselects } = this.panning;
-      this.panning = null;
-      this.overlay.releasePointerCapture(e.pointerId);
-      if (!moved && clickDeselects && this.selection) {
+    const drag = this.drag;
+    if (!drag) return;
+    this.drag = null;
+    if (this.overlay.hasPointerCapture(e.pointerId)) this.overlay.releasePointerCapture(e.pointerId);
+    if (drag.kind === "pan" && !drag.moved) {
+      if (drag.onClick === "undo-point" && this.draft?.length) {
+        this.draft.pop();
+        this.onEdit("selection");
+      } else if (drag.onClick === "deselect" && this.selection) {
         this.selection = null;
         this.onEdit("selection");
-        this.draw();
       }
-      this.overlay.style.cursor = this.cursorStyle();
-      return;
     }
-    if (this.dragging !== null) {
-      this.dragging = null;
-      this.overlay.releasePointerCapture(e.pointerId);
-    }
+    if (drag.kind === "transform" || drag.kind === "point") this.onEdit("selection");
+    this.overlay.style.cursor = this.cursorStyle(e);
+    this.draw();
   }
 
   private doubleClick(e: MouseEvent): void {
+    if (this.draft) return;
     const p = this.toKm(e);
-    if (this.hitPoint(p) !== null) return;
+    const selected = this.selectedShape();
+    if (selected && this.hitPoint(p, selected.points) !== null) return;
     const seg = this.hitSegment(p);
     if (!seg) return;
-    const { points, params } = this.model;
+    const { points, adjust } = seg.shape;
     points.splice(seg.index + 1, 0, seg.at);
-    // The split halves both keep the original segment's settings.
-    params.splice(seg.index + 1, 0, { ...params[seg.index] });
-    this.selection = { kind: "point", index: seg.index + 1 };
+    // The split halves both keep the original segment's adjustment.
+    adjust.splice(seg.index + 1, 0, { ...adjust[seg.index] });
+    this.selection = { kind: "point", shape: seg.shape.id, index: seg.index + 1 };
     this.onEdit("shape");
     this.onEdit("selection");
     this.draw();
@@ -287,7 +702,7 @@ export class CoastEditor {
   private key(e: KeyboardEvent): void {
     const target = e.target as HTMLElement | null;
     if (target && ["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(target.tagName)) return;
-    const { model } = this;
+    if (e.key === "Shift") this.shiftHeld = true;
     if (e.key === " ") {
       this.spaceHeld = true;
       this.overlay.style.cursor = this.cursorStyle();
@@ -295,18 +710,20 @@ export class CoastEditor {
       return;
     }
     if (e.key === "Escape") {
-      if (!model.closed && model.points.length) {
-        model.points = [];
-        this.onEdit("shape");
+      if (this.draft?.length) {
+        this.draft = [];
+        this.onEdit("selection");
+      } else if (this.draft) {
+        this.cancelDraft();
       } else {
         this.selection = null;
         this.onEdit("selection");
       }
       this.draw();
     } else if (e.key === "Backspace" || e.key === "Delete") {
-      if (!model.closed && model.points.length) {
-        model.points.pop();
-        this.onEdit("shape");
+      if (this.draft?.length) {
+        this.draft.pop();
+        this.onEdit("selection");
         this.draw();
         e.preventDefault();
       } else if (this.selection?.kind === "point") {
@@ -316,16 +733,26 @@ export class CoastEditor {
     }
   }
 
-  private cursorStyle(): string {
-    if (this.dragging !== null || this.panning) return "grabbing";
+  private cursorStyle(e?: PointerEvent): string {
+    if (this.drag?.kind === "pan" && this.drag.moved) return "grabbing";
+    if (this.drag?.kind === "point") return "grabbing";
+    if (this.drag?.kind === "transform") return this.drag.mode === "move" ? "grabbing" : "crosshair";
     if (this.spaceHeld) return "grab";
-    if (!this.model.closed) return this.model.points.length >= 3 && this.hover?.kind === "point" && this.hover.index === 0 ? "pointer" : "crosshair";
+    if (this.draft) return this.hover?.kind === "point" ? "pointer" : "crosshair";
+    const selected = this.selectedShape();
+    if (e && selected && this.selection?.kind === "shape" && !selected.locked && !selected.hidden) {
+      const handle = this.hitHandle(e, selected);
+      if (handle === "rotate") return "alias";
+      if (handle === 0 || handle === 2) return "nwse-resize";
+      if (handle === 1 || handle === 3) return "nesw-resize";
+      if (handle === "inside" && this.hover?.kind !== "point" && this.hover?.kind !== "segment") return "move";
+    }
     if (this.hover?.kind === "point") return "grab";
-    if (this.hover?.kind === "segment") return "pointer";
+    if (this.hover?.kind === "segment" || this.hover?.kind === "shape") return "pointer";
     return "grab";
   }
 
-  // --- drawing --------------------------------------------------------------
+  // --- drawing ----------------------------------------------------------------------
 
   draw(): void {
     const c = this.overlay;
@@ -340,7 +767,10 @@ export class CoastEditor {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     this.drawGrid();
-    this.drawGuide();
+    for (const shape of this.shapes) if (!shape.hidden) this.drawShape(shape);
+    const selected = this.selectedShape();
+    if (selected && !selected.hidden && this.selection?.kind === "shape" && !selected.locked) this.drawHandles(selected);
+    if (this.draft) this.drawDraft(this.draft);
     this.drawScale();
   }
 
@@ -360,7 +790,6 @@ export class CoastEditor {
     const h = this.overlay.clientHeight;
     const step = this.niceKm(56);
     const pxPerKm = size / this.extentKm;
-    // Only the lines that are on screen.
     const kmAt = (px: number, origin: number) => (px - origin) / pxPerKm;
     const fromX = Math.max(step, Math.ceil(kmAt(0, left) / step) * step);
     const toX = Math.min(this.extentKm - step / 2, kmAt(w, left));
@@ -405,44 +834,34 @@ export class CoastEditor {
     ctx.fillText(`${km.toLocaleString()} km`, x + len + 8, y + 1);
   }
 
-  private drawGuide(): void {
+  private path(pts: Vec2[], closed: boolean): void {
     const ctx = this.ctx;
-    const pts = this.model.points.map((p) => this.toPx(p));
-    if (!pts.length) return;
-    const closed = this.model.closed;
+    ctx.beginPath();
+    pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+    if (closed) ctx.closePath();
+  }
 
-    const path = () => {
-      ctx.beginPath();
-      pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-      if (closed) ctx.closePath();
-    };
-
-    // Halo first so the line reads over both sea and land.
-    path();
+  private drawShape(shape: ShapeModel): void {
+    const ctx = this.ctx;
+    const pts = shape.points.map((p) => this.toPx(p));
+    const focused = this.selection?.shape === shape.id;
+    const hovered = this.hover?.shape === shape.id && this.hover.kind === "shape";
     ctx.lineJoin = "round";
-    ctx.strokeStyle = "rgba(10, 20, 28, 0.45)";
-    ctx.lineWidth = 4;
-    ctx.stroke();
-    path();
-    ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
 
-    // Rubber band to the cursor while drawing.
-    if (!closed && this.cursor) {
-      const last = pts[pts.length - 1];
-      const to = this.toPx(this.cursor);
-      ctx.setLineDash([5, 5]);
-      ctx.strokeStyle = "rgba(255, 255, 255, 0.7)";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(last.x, last.y);
-      ctx.lineTo(to.x, to.y);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
+    this.path(pts, true);
+    ctx.strokeStyle = HALO;
+    ctx.lineWidth = focused ? 4 : 3;
+    ctx.stroke();
+    this.path(pts, true);
+    const ink = shape.kind === "water" ? WATER_GUIDE : GUIDE;
+    ctx.strokeStyle = ink;
+    ctx.globalAlpha = shape.locked ? 0.55 : focused || hovered ? 1 : 0.75;
+    ctx.lineWidth = focused ? 1.75 : 1.25;
+    ctx.setLineDash(shape.locked ? [4, 4] : []);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
 
-    // Hovered and selected segments.
     const segment = (index: number, color: string, width: number) => {
       const a = pts[index];
       const b = pts[(index + 1) % pts.length];
@@ -453,29 +872,89 @@ export class CoastEditor {
       ctx.lineTo(b.x, b.y);
       ctx.stroke();
     };
-    if (closed && this.hover?.kind === "segment" && !(this.selection?.kind === "segment" && this.selection.index === this.hover.index)) {
+    const sel = this.selection;
+    if (this.hover?.kind === "segment" && this.hover.shape === shape.id && !(sel?.kind === "segment" && sel.shape === shape.id && sel.index === this.hover.index)) {
       segment(this.hover.index, "rgba(242, 176, 30, 0.55)", 4);
     }
-    if (this.selection?.kind === "segment") segment(this.selection.index, "#f2b01e", 4);
+    if (sel?.kind === "segment" && sel.shape === shape.id) segment(sel.index, HIGHLIGHT, 4);
 
-    // Points.
-    const closable = !closed && pts.length >= 3;
+    // Points only for the shape being edited, to keep the map uncluttered.
+    if (focused && !shape.locked) {
+      pts.forEach((p, i) => {
+        const selected = sel?.kind === "point" && sel.index === i;
+        const hover = this.hover?.kind === "point" && this.hover.shape === shape.id && this.hover.index === i;
+        this.square(p, hover || selected ? 5 : 3.5, selected ? HIGHLIGHT : ink);
+      });
+    }
+  }
+
+  private square(p: Vec2, r: number, fill: string): void {
+    const ctx = this.ctx;
+    ctx.fillStyle = fill;
+    ctx.strokeStyle = "rgba(10, 20, 28, 0.8)";
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(p.x - r, p.y - r, r * 2, r * 2);
+    ctx.strokeRect(p.x - r, p.y - r, r * 2, r * 2);
+  }
+
+  private drawHandles(shape: ShapeModel): void {
+    const ctx = this.ctx;
+    const { corners, rotate } = this.handles(shape);
+    const topMid = { x: (corners[0].x + corners[1].x) / 2, y: corners[0].y };
+    ctx.strokeStyle = HIGHLIGHT;
+    ctx.lineWidth = 1.25;
+    ctx.setLineDash([5, 4]);
+    this.path(corners, true);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(topMid.x, topMid.y);
+    ctx.lineTo(rotate.x, rotate.y);
+    ctx.stroke();
+    for (const c of corners) this.square(c, 5, "#ffffff");
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "rgba(10, 20, 28, 0.8)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(rotate.x, rotate.y, 5.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  private drawDraft(draft: Vec2[]): void {
+    const ctx = this.ctx;
+    if (!draft.length) return;
+    const pts = draft.map((p) => this.toPx(p));
+    this.path(pts, false);
+    ctx.strokeStyle = HALO;
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    this.path(pts, false);
+    ctx.strokeStyle = GUIDE;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    if (this.cursor) {
+      const last = pts[pts.length - 1];
+      const to = this.toPx(this.cursor);
+      ctx.setLineDash([5, 5]);
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.7)";
+      ctx.beginPath();
+      ctx.moveTo(last.x, last.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    const closable = draft.length >= 3;
     pts.forEach((p, i) => {
-      const selected = this.selection?.kind === "point" && this.selection.index === i;
-      const hovered = this.hover?.kind === "point" && this.hover.index === i;
       if (closable && i === 0) {
-        ctx.strokeStyle = "#f2b01e";
+        const hovered = this.hover?.kind === "point" && this.hover.shape === -1;
+        ctx.strokeStyle = HIGHLIGHT;
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(p.x, p.y, hovered ? 9 : 7, 0, Math.PI * 2);
         ctx.stroke();
       }
-      const r = hovered || selected ? 5 : 3.5;
-      ctx.fillStyle = selected ? "#f2b01e" : "#ffffff";
-      ctx.strokeStyle = "rgba(10, 20, 28, 0.8)";
-      ctx.lineWidth = 1.5;
-      ctx.fillRect(p.x - r, p.y - r, r * 2, r * 2);
-      ctx.strokeRect(p.x - r, p.y - r, r * 2, r * 2);
+      this.square(p, 3.5, GUIDE);
     });
   }
 }

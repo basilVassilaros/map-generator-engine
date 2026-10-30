@@ -7,7 +7,7 @@
 //     whenever the view is zoomed in. Until it's ready, the base map is shown
 //     enlarged, so zooming always responds instantly.
 
-import { CoastEditor, toGuide, type EditKind } from "./editor";
+import { CoastEditor, type EditKind, type ShapeModel } from "./editor";
 import { EngineClient, type Frame } from "./engine-client";
 import { exportPng } from "./export";
 import { MAX_SHORE_KM, MIN_SHORE_KM, type SegmentParams } from "./protocol";
@@ -30,6 +30,14 @@ const displayCtx = display.getContext("2d")!;
 
 const generateBtn = $<HTMLButtonElement>("generate");
 const clearBtn = $<HTMLButtonElement>("clear");
+const newShapeBtn = $<HTMLButtonElement>("new-shape");
+const shapeList = $<HTMLUListElement>("shape-list");
+const shapePanel = $<HTMLElement>("shape-panel");
+const shapeName = $<HTMLInputElement>("shape-name");
+const shapeFacts = $<HTMLParagraphElement>("shape-facts");
+const shapeHelp = $<HTMLParagraphElement>("shape-help");
+const deleteShapeBtn = $<HTMLButtonElement>("delete-shape");
+const segmentShape = $<HTMLParagraphElement>("segment-shape");
 const exportBtn = $<HTMLButtonElement>("export");
 const exportStatus = $<HTMLParagraphElement>("export-status");
 const guidance = $<HTMLParagraphElement>("guidance");
@@ -221,7 +229,7 @@ function startDetail(): void {
   canvas.height = height;
   const initVersion = detail.init(width, height, area.w, area.x, area.y);
   detailPending = { canvas, ...area, initVersion, ready: false };
-  detail.setCoast(toGuide(editor.model));
+  detail.setGuides(editor.guides());
 }
 
 function paint(canvas: HTMLCanvasElement, frame: Frame): void {
@@ -237,27 +245,27 @@ function startBase(): void {
   baseCanvas.width = resolution;
   baseCanvas.height = resolution;
   baseInit = base.init(resolution, resolution, EXTENT_KM);
-  if (generated) base.setCoast(toGuide(editor.model));
+  if (generated) base.setGuides(editor.guides());
 }
 
 base.onFrame = (frame) => {
   if (frame.initVersion !== baseInit) return; // From before a resolution change.
   paint(baseCanvas, frame);
   render();
-  if (frame.kind === "coast" && !detailShown) showTiming(frame, "Whole map");
+  if (frame.kind === "guides" && !detailShown) showTiming(frame, "Whole map");
 };
 
 detail.onFrame = (frame) => {
   if (detailPending && frame.initVersion === detailPending.initVersion) {
     paint(detailPending.canvas, frame);
-    if (frame.kind === "coast") {
+    if (frame.kind === "guides") {
       // The new view has its terrain: swap it in.
       detailShown = { ...detailPending, ready: true };
       detailPending = null;
       detailBadge.hidden = true;
       render();
     }
-  } else if (detailShown && frame.initVersion === detailShown.initVersion && frame.kind === "coast") {
+  } else if (detailShown && frame.initVersion === detailShown.initVersion && frame.kind === "guides") {
     paint(detailShown.canvas, frame);
     render();
     showTiming(frame, "Zoomed view");
@@ -283,42 +291,136 @@ function showTiming(frame: Frame, what: string): void {
 
 // --- panel -----------------------------------------------------------------------
 
+const ICON_EYE = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M1.5 10S5 4 10 4s8.5 6 8.5 6-3.5 6-8.5 6-8.5-6-8.5-6Z" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="10" cy="10" r="2.6" fill="currentColor"/></svg>';
+const ICON_EYE_OFF = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M1.5 10S5 4 10 4s8.5 6 8.5 6-3.5 6-8.5 6-8.5-6-8.5-6Z" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".45"/><path d="M3 17 17 3" stroke="currentColor" stroke-width="1.6"/></svg>';
+const ICON_LOCK = '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="4" y="9" width="12" height="8" rx="1.5" fill="currentColor"/><path d="M6.5 9V6.5a3.5 3.5 0 0 1 7 0V9" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>';
+const ICON_UNLOCK = '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="4" y="9" width="12" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".6"/><path d="M6.5 9V6.5a3.5 3.5 0 0 1 6.8-1.2" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".6"/></svg>';
+
 function guidanceText(): string {
-  const { points, closed } = editor.model;
-  if (!points.length) return "Click on the map to place the first point of your coastline.";
-  if (!closed) {
-    return points.length < 3
-      ? "Keep clicking to add points around the landmass."
-      : "Click the first point to close the shape. Backspace removes the last point, Escape starts over.";
+  const draft = editor.draft;
+  const count = editor.shapes.length;
+  if (draft) {
+    if (!draft.length) {
+      return count
+        ? "Click on the map to start the new shape. Escape cancels."
+        : "Click on the map to place the first point of your coastline.";
+    }
+    return draft.length < 3
+      ? "Keep clicking to add points around the shape. Right-click or Backspace removes the last point."
+      : "Click the first point to close the shape. Right-click or Backspace removes the last point, Escape starts over.";
   }
-  if (!generated) return "The shape is closed. Generate the landmass to see the terrain.";
-  return "Click a segment of the coastline to adjust it. Drag points to reshape it, double-click a segment to add a point.";
+  if (!generated) return "Generate the landmass to see the terrain, or add another shape first.";
+  const sel = editor.selection;
+  if (sel?.kind === "segment") return "";
+  if (sel?.kind === "point") return "Drag the point to reshape the coast. Delete or Backspace removes it.";
+  // A selected shape's instructions live in its own panel.
+  if (sel?.kind === "shape") return "";
+  return "Click a shape to select it, or a stretch of its coast to adjust it.";
+}
+
+/** Clicking once arms a destructive button; a second click within a few seconds confirms. */
+function confirmable(button: HTMLButtonElement, label: string, confirm: string, action: () => void): void {
+  let armed = 0;
+  button.addEventListener("click", () => {
+    if (armed) {
+      clearTimeout(armed);
+      armed = 0;
+      button.textContent = label;
+      button.classList.remove("armed");
+      action();
+      return;
+    }
+    button.textContent = confirm;
+    button.classList.add("armed");
+    armed = window.setTimeout(() => {
+      armed = 0;
+      button.textContent = label;
+      button.classList.remove("armed");
+    }, 4000);
+  });
+}
+
+function renderShapeList(): void {
+  shapeList.replaceChildren(
+    ...editor.shapes.map((shape) => {
+      const li = document.createElement("li");
+      li.className = "shape-row";
+      const selected = editor.selection?.shape === shape.id;
+      li.classList.toggle("selected", selected);
+      li.classList.toggle("hidden-shape", shape.hidden);
+
+      const pick = document.createElement("button");
+      pick.className = "shape-pick";
+      pick.setAttribute("aria-pressed", String(selected));
+      pick.innerHTML = `<span class="shape-name"></span><span class="shape-kind">Land · ${shape.points.length} points</span>`;
+      pick.querySelector(".shape-name")!.textContent = shape.name;
+      pick.addEventListener("click", () => editor.select({ kind: "shape", shape: shape.id }));
+
+      const hide = document.createElement("button");
+      hide.className = "icon-btn";
+      hide.innerHTML = shape.hidden ? ICON_EYE_OFF : ICON_EYE;
+      hide.setAttribute("aria-label", shape.hidden ? `Show ${shape.name}` : `Hide ${shape.name}`);
+      hide.title = shape.hidden ? "Show" : "Hide";
+      hide.addEventListener("click", () => editor.toggleHidden(shape.id));
+
+      const lock = document.createElement("button");
+      lock.className = "icon-btn";
+      lock.innerHTML = shape.locked ? ICON_LOCK : ICON_UNLOCK;
+      lock.setAttribute("aria-label", shape.locked ? `Unlock ${shape.name}` : `Lock ${shape.name}`);
+      lock.title = shape.locked ? "Unlock" : "Lock";
+      lock.addEventListener("click", () => editor.toggleLocked(shape.id));
+
+      li.append(pick, hide, lock);
+      return li;
+    }),
+  );
+  if (editor.draft && editor.shapes.length) {
+    const li = document.createElement("li");
+    li.className = "shape-row drafting";
+    li.textContent = "New shape: drawing…";
+    shapeList.append(li);
+  }
 }
 
 function refreshPanel(): void {
-  const { model, selection } = editor;
+  const sel = editor.selection;
+  const shape: ShapeModel | undefined = editor.selectedShape();
   guidance.textContent = guidanceText();
-  generateBtn.disabled = !model.closed || generated;
+  generateBtn.disabled = !editor.shapes.length || generated;
   generateBtn.textContent = generated ? "Landmass generated" : "Generate landmass";
-  clearBtn.disabled = model.points.length === 0;
+  clearBtn.disabled = !editor.shapes.length && !editor.draft?.length;
   exportBtn.disabled = !generated;
+  newShapeBtn.disabled = editor.drawing;
+  renderShapeList();
 
-  const seg = generated && selection?.kind === "segment" ? selection.index : null;
+  shapePanel.hidden = !shape || sel?.kind !== "shape";
+  if (shape && sel?.kind === "shape") {
+    if (document.activeElement !== shapeName) shapeName.value = shape.name;
+    shapeName.disabled = false;
+    shapeFacts.textContent = `Land · ${shape.points.length} points${shape.hidden ? " · hidden" : ""}${shape.locked ? " · locked" : ""}`;
+    shapeHelp.textContent = shape.locked
+      ? "This shape is locked, so it can't be selected or changed on the map. Unlock it in the list above to edit it."
+      : "Drag inside the box to move, drag a corner to resize (Shift keeps proportions), drag the round handle to rotate (Shift snaps to 15°).";
+    deleteShapeBtn.disabled = shape.locked;
+  }
+
+  const seg = generated && sel?.kind === "segment" && shape ? sel.index : null;
   segmentPanel.hidden = seg === null;
-  if (seg !== null) {
-    segmentTitle.textContent = `Segment ${seg + 1} of ${model.points.length}`;
-    const p = model.params[seg];
+  if (seg !== null && shape) {
+    segmentTitle.textContent = `Segment ${seg + 1} of ${shape.points.length}`;
+    segmentShape.textContent = `${shape.name}. Double-click the line on the map to add a point there.`;
+    const p = shape.params[seg];
     sliders.roughness.value = String(Math.round(p.roughness * 100));
     sliders.coves.value = String(Math.round(p.coves * 100));
     sliders.shore.value = String(sliderFromShore(p.shoreKm));
     showReadouts(p);
   }
 
-  const point = model.closed && selection?.kind === "point" ? selection.index : null;
+  const point = sel?.kind === "point" && shape ? sel.index : null;
   pointPanel.hidden = point === null;
-  if (point !== null) {
-    pointTitle.textContent = `Point ${point + 1} of ${model.points.length}`;
-    deletePointBtn.disabled = model.points.length <= 3;
+  if (point !== null && shape) {
+    pointTitle.textContent = `Point ${point + 1} of ${shape.points.length}`;
+    deletePointBtn.disabled = shape.points.length <= 3;
   }
 }
 
@@ -350,18 +452,30 @@ applyAllBtn.addEventListener("click", () => editor.applyToAll(paramsFromSliders(
 deletePointBtn.addEventListener("click", () => {
   if (editor.selection?.kind === "point") editor.deletePoint(editor.selection.index);
 });
+newShapeBtn.addEventListener("click", () => editor.newShape());
+shapeName.addEventListener("change", () => {
+  const shape = editor.selectedShape();
+  if (shape) editor.rename(shape.id, shapeName.value);
+});
+shapeName.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") shapeName.blur();
+});
+confirmable(deleteShapeBtn, "Delete shape", "Click again to delete", () => {
+  const shape = editor.selectedShape();
+  if (shape) editor.deleteShape(shape.id);
+});
 
 generateBtn.addEventListener("click", () => {
   generated = true;
-  base.setCoast(toGuide(editor.model));
+  base.setGuides(editor.guides());
   scheduleDetail();
   refreshPanel();
 });
 
-clearBtn.addEventListener("click", () => {
+confirmable(clearBtn, "Clear all shapes", "Click again to clear", () => {
   generated = false;
-  editor.clear();
-  base.setCoast(null);
+  editor.clearAll();
+  base.setGuides(editor.guides());
   scheduleDetail();
   timing.textContent = "No updates yet";
   timing.classList.remove("slow");
@@ -384,9 +498,9 @@ resolutionSelect.addEventListener("change", () => {
 
 editor.onEdit = (kind: EditKind) => {
   if (kind === "shape" && generated) {
-    const guide = toGuide(editor.model);
-    base.setCoast(guide);
-    if (detailActive()) detail.setCoast(guide);
+    const guides = editor.guides();
+    base.setGuides(guides);
+    if (detailActive()) detail.setGuides(guides);
   }
   refreshPanel();
 };

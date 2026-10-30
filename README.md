@@ -1,5 +1,16 @@
 # World Map Generator
 
+## Note
+This project is mostly made using Claude.ai and thus I am having it be completely open-sourced.
+It is to serve more of a concept of what is possible.
+
+## Introduction
+For too long the tools available for making realistic maps has been an effort 
+in terms of drawing out heightmaps using randomized cells. And if the shape of 
+landmass or mountains set is not to your liking, it required you to erase and redraw.
+
+## What is this tool?
+
 A browser tool for generating realistic world maps from rough guides. You draw
 a coastline point by point, generate the landmass, then tune each stretch of
 coast with sliders and watch the terrain update live.
@@ -77,12 +88,9 @@ See `docs/ARCHITECTURE.md` for how the pieces fit together.
 
 ## License
 
-Licensed under either of
+Licensed under 
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
 
 ### Maps you make are yours
 

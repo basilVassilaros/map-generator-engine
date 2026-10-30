@@ -63,6 +63,36 @@ pub struct Coastline {
     pub seed: u32,
 }
 
+/// Where a shape's coastline detail is anchored: a position (km) and a
+/// rotation (radians). Moving or rotating a shape moves its frame with it, so
+/// the coves and headlands travel with the shape instead of changing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Frame {
+    pub x: f32,
+    pub y: f32,
+    pub angle: f32,
+}
+
+impl Frame {
+    /// World position (km) to the shape's own coordinates.
+    #[inline]
+    pub fn to_local(&self, p: [f32; 2]) -> [f32; 2] {
+        let (s, c) = (-self.angle).sin_cos();
+        let dx = p[0] - self.x;
+        let dy = p[1] - self.y;
+        [c * dx - s * dy, s * dx + c * dy]
+    }
+}
+
+/// One closed outline drawn by the user, with its own identity and frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shape {
+    /// Stable identity, so the engine can tell an edited shape from a new one.
+    pub id: u32,
+    pub coast: Coastline,
+    pub frame: Frame,
+}
+
 /// Fraction of each segment at either end that blends into the neighbouring
 /// segment's parameters, so adjacent segments never meet at a visible seam.
 const BLEND: f32 = 0.3;

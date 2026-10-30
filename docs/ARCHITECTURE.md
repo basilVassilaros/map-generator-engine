@@ -27,6 +27,24 @@ tiny, so sending all of it each time is simpler and safer than sending edits.
 The core has no imports, so the same code runs natively for tests and
 benchmarks, and could run on a server for large exports later.
 
+## Shapes
+
+The guides are a list of shapes, each a closed outline with per-segment
+parameters, a seed, and a **frame** (a position and rotation). The frame
+anchors the shape's coastline noise, so moving or rotating a shape carries
+its coves and headlands with it. Resizing leaves the frame in place, so the
+outline scales while fine detail is regenerated at real-world scale rather
+than stretched. The lowland height under the coast is anchored to the world.
+
+Shapes combine as a union: a cell is land if any shape makes it land, and
+where shapes overlap, the one reaching furthest inland decides the terrain.
+Each shape keeps its own caches (distance to its coast, inside/outside, and
+its coastline noise) covering only the area it can reach. Noise is computed
+lazily, only near the coast, since cells far inland or out at sea never use it.
+
+Hidden shapes are simply left out of the guides. Locking is purely an
+editor feature.
+
 ## Zoom: two cores, one world
 
 The browser runs two copies of the core, each in its own background thread.
@@ -57,27 +75,30 @@ The engine caches what doesn't depend on the edit:
 
 | Cache | Depends on | Recomputed when |
 | --- | --- | --- |
-| Lowland height, shoreline noise | Seed | A new coastline is generated |
-| Distance, nearest segment, inside/outside | Coastline shape | Points move, near those points |
+| Lowland height (per world) | World seed | The project starts |
+| Shoreline noise (per shape) | Shape seed and frame | The shape is moved or rotated |
+| Distance, nearest segment, inside/outside (per shape) | Shape outline | Points move, near those points |
 | Elevation and preview pixels | Everything | Any edit, only where it can reach |
 
 A slider edit changes no geometry, so it recomputes only cells whose nearest
 segment was retuned, re-weighting cached noise. That is why it's the fastest
 edit.
 
-## Measured performance (Sprint 1)
+## Measured performance
 
-Core only, measured in Node.js on the build machine. Browser times will vary
-with hardware; the app shows live timings.
+Core only, measured in Node.js on the build machine with three shapes.
+Browser times vary with hardware; the app shows live timings.
 
-| Resolution | Generate landmass | Slider edit (median) | Point drag (median) |
-| --- | --- | --- | --- |
-| 1024 × 1024 | about 0.9 s | about 30 ms | about 34 ms |
-| 2048 × 2048 | about 3.5 s | about 121 ms | about 120 ms |
+| Edit | 1024 × 1024 | 2048 × 2048 |
+| --- | --- | --- |
+| Generate landmass | about 0.65 s | about 2.7 s |
+| Slider on one segment | about 11 ms | about 43 ms |
+| Dragging one point | about 22 ms | about 86 ms |
+| Resizing a whole shape | about 24 ms | about 105 ms |
+| Moving or rotating a whole shape | about 95 ms | about 390 ms |
 
-1024 meets the 100 ms target comfortably. 2048 doesn't yet; that is the
-first candidate for GPU acceleration once more of the pipeline exists.
+Moving and rotating are slowest because they shift the shape's noise frame,
+so its coastline noise is recomputed. The outline on screen always follows
+the mouse immediately; at 2048 the terrain trails slightly behind.
 
-A zoomed view takes about 1 to 1.5 s to sharpen after the view stops moving,
-and edits while zoomed run about 70 to 120 ms, since the visible window is
-usually entirely within reach of the edited segment.
+A zoomed view takes about 1 to 1.5 s to sharpen after the view stops moving.

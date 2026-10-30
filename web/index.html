@@ -27,7 +27,7 @@
 
       <div class="actions">
         <button id="generate" class="primary" disabled>Generate landmass</button>
-        <button id="clear" class="quiet" disabled>Clear coastline</button>
+        <button id="clear" class="quiet" disabled>Clear all shapes</button>
         <button id="export" class="quiet" disabled>Export PNG</button>
         <p id="export-status" class="hint" aria-live="polite"></p>
       </div>
@@ -48,12 +48,28 @@
 
     <aside class="inspector" aria-label="Settings">
       <section class="block">
-        <h2>Coastline</h2>
+        <div class="block-head">
+          <h2>Shapes</h2>
+          <button id="new-shape" class="small">New shape</button>
+        </div>
+        <ul id="shape-list" class="shape-list" aria-label="Coastline shapes"></ul>
         <p id="guidance" class="guidance" aria-live="polite"></p>
+      </section>
+
+      <section id="shape-panel" class="block" hidden>
+        <h2>Shape</h2>
+        <div class="field">
+          <div class="field-head"><label for="shape-name">Name</label></div>
+          <input id="shape-name" type="text" maxlength="60" autocomplete="off">
+        </div>
+        <p id="shape-facts" class="hint"></p>
+        <p id="shape-help" class="hint"></p>
+        <button id="delete-shape" class="quiet danger">Delete shape</button>
       </section>
 
       <section id="segment-panel" class="block" hidden>
         <h2 id="segment-title">Segment</h2>
+        <p id="segment-shape" class="hint segment-shape"></p>
         <div class="field">
           <div class="field-head"><label for="roughness">Roughness</label><output id="roughness-value"></output></div>
           <input id="roughness" type="range" min="0" max="100" step="1">

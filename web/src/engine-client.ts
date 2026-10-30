@@ -6,7 +6,7 @@
 // the latest state and never on a backlog.
 
 import { CoreHost } from "./core-host";
-import type { CoastGuide, FromCore, Rect, ToCore } from "./protocol";
+import type { FromCore, Guides, Rect, ToCore } from "./protocol";
 
 declare const __WORKER_SOURCE__: string;
 declare const __WASM_BASE64__: string;
@@ -37,10 +37,10 @@ export class EngineClient {
   private version = 0;
   private inFlight: ToCore | null = null;
   private waitingInit: ToCore | null = null;
-  private waitingCoast: ToCore | null = null;
+  private waitingGuides: ToCore | null = null;
   private sentAt = new Map<number, number>();
   private lastInit: ToCore | null = null;
-  private lastCoast: ToCore | null = null;
+  private lastGuides: ToCore | null = null;
   private appliedInit = 0;
 
   constructor() {
@@ -72,18 +72,18 @@ export class EngineClient {
     return msg.version;
   }
 
-  setCoast(coast: CoastGuide | null): void {
-    this.waitingCoast = { type: "coast", version: ++this.version, coast: coast && structuredClone(coast) };
-    this.lastCoast = this.waitingCoast;
+  setGuides(guides: Guides): void {
+    this.waitingGuides = { type: "guides", version: ++this.version, guides: structuredClone(guides) };
+    this.lastGuides = this.waitingGuides;
     this.pump();
   }
 
   private pump(): void {
     if (this.inFlight) return;
-    const next = this.waitingInit ?? this.waitingCoast;
+    const next = this.waitingInit ?? this.waitingGuides;
     if (!next) return;
     if (next === this.waitingInit) this.waitingInit = null;
-    else this.waitingCoast = null;
+    else this.waitingGuides = null;
     this.inFlight = next;
     this.sentAt.set(next.version, performance.now());
     const msg = next.type === "init" ? { ...next, wasm: wasm() } : next;
@@ -114,7 +114,7 @@ export class EngineClient {
         pixels: new Uint8ClampedArray(out.pixels as ArrayBuffer),
         computeMs: out.computeMs,
         totalMs: performance.now() - sent,
-        kind: request?.type ?? "coast",
+        kind: request?.type ?? "guides",
         initVersion: this.appliedInit,
       });
     }
@@ -130,7 +130,7 @@ export class EngineClient {
     // Replay the latest state on the new host.
     this.inFlight = null;
     this.waitingInit = this.lastInit;
-    this.waitingCoast = this.lastCoast;
+    this.waitingGuides = this.lastGuides;
     this.pump();
   }
 }

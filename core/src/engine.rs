@@ -1,13 +1,16 @@
 //! The engine owns the world rasters and keeps them in sync with the guides.
 //!
-//! The guides are the source of truth. When new guide data arrives, the engine
-//! compares it with what it had, works out which cells the change can affect,
-//! and regenerates only those. Results are identical to regenerating the whole
-//! map; the tests in `tests/incremental.rs` hold it to that.
+//! The guides (a list of shapes) are the source of truth. When new guides
+//! arrive, the engine compares them with what it had, works out which cells
+//! the change can affect, and regenerates only those. Results are identical
+//! to regenerating the whole map; `tests/incremental.rs` holds it to that.
+//!
+//! Shapes combine as a union: a cell is land if it is land for any shape, and
+//! where shapes overlap the one reaching furthest inland decides the terrain.
 
 use crate::coast::{
     coast_bands, coastal_displacement, distance_to_segment, elevation_from_coast, inland_base,
-    CoastBands, Coastline, SegmentParams, CLAMP_KM,
+    CoastBands, Coastline, SegmentParams, Shape, CLAMP_KM,
 };
 use crate::render;
 
@@ -42,6 +45,11 @@ impl Rect {
         self.width() as u64 * self.height() as u64
     }
 
+    #[inline]
+    pub fn contains(&self, x: u32, y: u32) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
+
     pub fn union(self, other: Rect) -> Rect {
         if self.is_empty() {
             return other;
@@ -54,6 +62,20 @@ impl Rect {
             y0: self.y0.min(other.y0),
             x1: self.x1.max(other.x1),
             y1: self.y1.max(other.y1),
+        }
+    }
+
+    pub fn intersect(self, other: Rect) -> Rect {
+        let r = Rect {
+            x0: self.x0.max(other.x0),
+            y0: self.y0.max(other.y0),
+            x1: self.x1.min(other.x1),
+            y1: self.y1.min(other.y1),
+        };
+        if r.is_empty() {
+            Rect::EMPTY
+        } else {
+            r
         }
     }
 
@@ -70,6 +92,50 @@ impl Rect {
     }
 }
 
+/// Per-shape caches, covering only the cells the shape can reach.
+struct ShapeCache {
+    rect: Rect,
+    /// Distance to the nearest segment (clamped), which segment, where along it.
+    dist: Vec<f32>,
+    nearest: Vec<u32>,
+    along: Vec<f32>,
+    inside: Vec<bool>,
+    /// Coastline noise in the shape's own frame. Depends on seed and frame.
+    /// Only filled near the coast (where `nearest` is set); see `MISSING`.
+    bands: Vec<CoastBands>,
+}
+
+/// Marks noise not yet computed for a cell. Cells far from the coast never
+/// use noise, so it's computed lazily, only where a segment is in reach.
+const MISSING: CoastBands = CoastBands { big: f32::NAN, mid: 0.0, small: 0.0, rough: 0.0 };
+
+impl ShapeCache {
+    fn new(rect: Rect) -> Self {
+        let n = rect.cells() as usize;
+        Self {
+            rect,
+            dist: vec![CLAMP_KM; n],
+            nearest: vec![u32::MAX; n],
+            along: vec![0.0; n],
+            inside: vec![false; n],
+            bands: vec![MISSING; n],
+        }
+    }
+
+    #[inline]
+    fn index(&self, x: u32, y: u32) -> usize {
+        ((y - self.rect.y0) * self.rect.width() + (x - self.rect.x0)) as usize
+    }
+}
+
+/// Work queued while comparing old and new guides.
+enum Task {
+    /// Recompute every cell in the rectangle.
+    All(Rect),
+    /// Recompute only cells whose nearest segment of shape `shape` is flagged.
+    Retuned { rect: Rect, shape: usize, segments: Vec<bool> },
+}
+
 pub struct Engine {
     width: u32,
     height: u32,
@@ -78,17 +144,12 @@ pub struct Engine {
     cell_km: f32,
     elevation: Vec<f32>,
     rgba: Vec<u8>,
-    coast: Option<Coastline>,
-    // Caches, so an edit only redoes the work it can affect.
-    /// Lowland height and shoreline noise. Depend only on the seed.
+    world_seed: u32,
+    /// Lowland height, anchored to the world. Depends only on the world seed.
     base: Vec<f32>,
-    bands: Vec<CoastBands>,
     base_seed: Option<u32>,
-    /// Distance to the nearest segment (clamped), which segment, and where along it.
-    dist: Vec<f32>,
-    nearest: Vec<u32>,
-    along: Vec<f32>,
-    inside: Vec<bool>,
+    shapes: Vec<Shape>,
+    caches: Vec<ShapeCache>,
 }
 
 impl Engine {
@@ -100,8 +161,8 @@ impl Engine {
 
     /// Any window onto the world: `origin` is the world position (km) of the
     /// top-left corner, `cell_km` the size of one cell. A zoomed-in view uses
-    /// a small window with small cells; noise is placed by world position, so
-    /// the window lines up exactly with the whole map.
+    /// a small window with small cells; noise is placed by world position (or
+    /// by shape frame), so the window lines up exactly with the whole map.
     pub fn window(width: u32, height: u32, origin: [f32; 2], cell_km: f32) -> Self {
         let cells = width as usize * height as usize;
         let mut engine = Self {
@@ -111,14 +172,11 @@ impl Engine {
             cell_km,
             elevation: vec![EMPTY_ELEVATION; cells],
             rgba: vec![0; cells * 4],
-            coast: None,
-            base: vec![0.0; cells],
-            bands: vec![CoastBands::default(); cells],
+            world_seed: 0,
+            base: Vec::new(),
             base_seed: None,
-            dist: vec![CLAMP_KM; cells],
-            nearest: vec![u32::MAX; cells],
-            along: vec![0.0; cells],
-            inside: vec![false; cells],
+            shapes: Vec::new(),
+            caches: Vec::new(),
         };
         engine.shade(engine.full_rect());
         engine
@@ -140,117 +198,214 @@ impl Engine {
         &self.rgba
     }
 
-    pub fn coast(&self) -> Option<&Coastline> {
-        self.coast.as_ref()
+    pub fn shapes(&self) -> &[Shape] {
+        &self.shapes
     }
 
     pub fn full_rect(&self) -> Rect {
         Rect { x0: 0, y0: 0, x1: self.width, y1: self.height }
     }
 
-    /// Replace the coastline guide. Returns the rectangle of pixels that
-    /// changed (empty if nothing did).
+    /// Convenience for a single coastline (id 0, frame at the origin).
     pub fn set_coast(&mut self, coast: Option<Coastline>) -> Rect {
-        let coast = coast.filter(Coastline::is_valid).map(|mut c| {
-            for p in c.params.iter_mut() {
-                *p = p.sanitized();
-            }
-            c
-        });
-        let old = std::mem::replace(&mut self.coast, coast);
-        let changed = match (&old, &self.coast) {
-            (None, None) => Rect::EMPTY,
-            (Some(a), Some(b)) if a.len() == b.len() && a.seed == b.seed => {
-                let (a, b) = (a.clone(), b.clone());
-                self.apply_edit(&a, &b)
-            }
-            _ => self.regenerate_all(),
-        };
-        // Shading reads neighbouring cells, so one extra pixel of border changes too.
-        changed.grow(1, self.width, self.height)
+        let seed = coast.as_ref().map_or(0, |c| c.seed);
+        let shapes = coast.into_iter().map(|c| Shape { id: 0, coast: c, frame: Default::default() }).collect();
+        self.set_shapes(seed, shapes)
     }
 
-    /// Regenerate everything from the guides. Returns the cells that changed.
-    pub fn regenerate_all(&mut self) -> Rect {
-        let all = self.full_rect();
-        match self.coast.as_ref().map(|c| c.seed) {
-            None => self.elevation.fill(EMPTY_ELEVATION),
-            Some(seed) => {
-                if self.base_seed != Some(seed) {
-                    self.compute_base(seed);
+    /// Replace the guides. Returns the rectangle of pixels that changed
+    /// (empty if nothing did).
+    pub fn set_shapes(&mut self, world_seed: u32, shapes: Vec<Shape>) -> Rect {
+        let shapes: Vec<Shape> = shapes
+            .into_iter()
+            .filter(|s| s.coast.is_valid())
+            .map(|mut s| {
+                for p in s.coast.params.iter_mut() {
+                    *p = p.sanitized();
                 }
-                self.compute_geometry(all);
-                self.compute_terrain(all, None);
-            }
-        }
-        self.shade(all);
-        all
-    }
+                s
+            })
+            .collect();
 
-    /// Same number of points and same seed: make the smallest exact update.
-    fn apply_edit(&mut self, old: &Coastline, new: &Coastline) -> Rect {
-        let n = old.len();
-        let mut moved = vec![false; n];
-        let mut retuned = vec![false; n];
-        for k in 0..n {
-            if old.points[k] != new.points[k] {
-                // A point belongs to the segment ending and the one starting there.
-                moved[(k + n - 1) % n] = true;
-                moved[k] = true;
-            }
-            if old.params[k] != new.params[k] {
-                // Parameters blend into both neighbouring segments.
-                retuned[(k + n - 1) % n] = true;
-                retuned[k] = true;
-                retuned[(k + 1) % n] = true;
-            }
+        if world_seed != self.world_seed || (self.base_seed.is_none() && !shapes.is_empty()) {
+            // The lowland under every shape changes: start over.
+            self.world_seed = world_seed;
+            self.compute_base();
+            self.shapes = shapes;
+            self.caches = (0..self.shapes.len()).map(|k| self.build_cache(k, None)).collect();
+            let all = self.full_rect();
+            self.compute_terrain(all, None);
+            self.shade(all);
+            return all;
         }
-        let reach = |flags: &[bool], coast: &Coastline| {
-            flags
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| **f)
-                .fold(Rect::EMPTY, |r, (i, _)| r.union(self.segment_reach(coast, i)))
-        };
 
-        let changed = if moved.iter().any(|m| *m) {
-            // Geometry changed: distances must be recomputed wherever the old
-            // or new segments reach.
-            let either: Vec<bool> = moved.iter().zip(&retuned).map(|(m, r)| *m || *r).collect();
-            let rect = reach(&either, old).union(reach(&either, new));
-            self.compute_geometry(rect);
-            self.compute_terrain(rect, None)
-        } else if retuned.iter().any(|r| *r) {
-            // Only parameters changed: distances are still valid, and only
-            // cells whose nearest segment was retuned can change.
-            let rect = reach(&retuned, new);
-            self.compute_terrain(rect, Some(&retuned))
-        } else {
-            Rect::EMPTY
-        };
-        if !changed.is_empty() {
-            self.shade(changed.grow(1, self.width, self.height));
+        let old_shapes = std::mem::take(&mut self.shapes);
+        let mut old_caches: Vec<Option<ShapeCache>> = std::mem::take(&mut self.caches).into_iter().map(Some).collect();
+        self.shapes = shapes;
+        let mut tasks: Vec<Task> = Vec::new();
+        let mut caches: Vec<ShapeCache> = Vec::with_capacity(self.shapes.len());
+
+        for k in 0..self.shapes.len() {
+            let id = self.shapes[k].id;
+            let previous = old_shapes.iter().position(|s| s.id == id);
+            let Some(j) = previous else {
+                // A new shape.
+                let cache = self.build_cache(k, None);
+                tasks.push(Task::All(cache.rect));
+                caches.push(cache);
+                continue;
+            };
+            let old = &old_shapes[j];
+            let old_cache = old_caches[j].take().expect("each old shape is matched once");
+            let new = &self.shapes[k];
+
+            if old.coast.seed != new.coast.seed || old.frame != new.frame || old.coast.len() != new.coast.len() {
+                // Moved, rotated, scaled, reseeded, or points added/removed:
+                // rebuild this shape. Its old and new areas both change.
+                let keep_bands = old.coast.seed == new.coast.seed && old.frame == new.frame;
+                let old_rect = old_cache.rect;
+                let cache = self.build_cache(k, keep_bands.then_some(old_cache));
+                tasks.push(Task::All(old_rect.union(cache.rect)));
+                caches.push(cache);
+                continue;
+            }
+
+            let n = new.coast.len();
+            let mut moved = vec![false; n];
+            let mut retuned = vec![false; n];
+            for i in 0..n {
+                if old.coast.points[i] != new.coast.points[i] {
+                    // A point belongs to the segment ending and the one starting there.
+                    moved[(i + n - 1) % n] = true;
+                    moved[i] = true;
+                }
+                if old.coast.params[i] != new.coast.params[i] {
+                    // Parameters blend into both neighbouring segments.
+                    retuned[(i + n - 1) % n] = true;
+                    retuned[i] = true;
+                    retuned[(i + 1) % n] = true;
+                }
+            }
+
+            if moved.iter().any(|m| *m) {
+                let either: Vec<bool> = moved.iter().zip(&retuned).map(|(m, r)| *m || *r).collect();
+                let touched = self.reach_of(&old.coast, &either).union(self.reach_of(&new.coast, &either));
+                if self.shape_rect(&new.coast) != old_cache.rect {
+                    // The shape's reach grew or shrank: rebuild its caches,
+                    // keeping the noise where the areas overlap.
+                    let cache = self.build_cache(k, Some(old_cache));
+                    caches.push(cache);
+                } else {
+                    let mut cache = old_cache;
+                    let r = touched.intersect(cache.rect);
+                    self.compute_geometry(k, &mut cache, r);
+                    caches.push(cache);
+                }
+                tasks.push(Task::All(touched));
+            } else if retuned.iter().any(|r| *r) {
+                // Only sliders changed: geometry is still valid, and only
+                // cells whose nearest segment was retuned can change.
+                let rect = self.reach_of(&new.coast, &retuned);
+                tasks.push(Task::Retuned { rect, shape: k, segments: retuned });
+                caches.push(old_cache);
+            } else {
+                caches.push(old_cache);
+            }
         }
-        changed
+        // Removed shapes leave their area to be recomputed.
+        for cache in old_caches.into_iter().flatten() {
+            tasks.push(Task::All(cache.rect));
+        }
+        self.caches = caches;
+
+        let mut changed = Rect::EMPTY;
+        for task in tasks {
+            let written = match task {
+                Task::All(rect) => self.compute_terrain(rect.intersect(self.full_rect()), None),
+                Task::Retuned { rect, shape, segments } => {
+                    self.compute_terrain(rect.intersect(self.full_rect()), Some((shape, &segments)))
+                }
+            };
+            changed = changed.union(written);
+        }
+        if changed.is_empty() {
+            return Rect::EMPTY;
+        }
+        let pixels = changed.grow(1, self.width, self.height);
+        self.shade(pixels);
+        pixels
     }
 
     fn shade(&mut self, pixels: Rect) {
         render::shade(&self.elevation, &mut self.rgba, self.width, self.height, self.cell_km * 1000.0, pixels);
     }
 
-    fn compute_base(&mut self, seed: u32) {
+    fn compute_base(&mut self) {
+        let cells = self.width as usize * self.height as usize;
+        self.base.resize(cells, 0.0);
         for cy in 0..self.height {
             for cx in 0..self.width {
                 let p = self.cell_center(cx, cy);
-                let idx = (cy * self.width + cx) as usize;
-                self.base[idx] = inland_base(p[0], p[1], seed, self.cell_km);
-                self.bands[idx] = coast_bands(p[0], p[1], seed, self.cell_km);
+                self.base[(cy * self.width + cx) as usize] = inland_base(p[0], p[1], self.world_seed, self.cell_km);
             }
         }
-        self.base_seed = Some(seed);
+        self.base_seed = Some(self.world_seed);
     }
 
-    /// Cells within CLAMP_KM of segment `i`: everything the segment can influence.
+    /// Fresh caches for shape `k`. With `reuse`, noise is copied from the old
+    /// caches where the areas overlap (only valid if seed and frame are unchanged).
+    fn build_cache(&self, k: usize, reuse: Option<ShapeCache>) -> ShapeCache {
+        let shape = &self.shapes[k];
+        let rect = self.shape_rect(&shape.coast);
+        let mut cache = ShapeCache::new(rect);
+        if let Some(old) = &reuse {
+            let overlap = old.rect.intersect(rect);
+            for cy in overlap.y0..overlap.y1 {
+                for cx in overlap.x0..overlap.x1 {
+                    let idx = cache.index(cx, cy);
+                    cache.bands[idx] = old.bands[old.index(cx, cy)];
+                }
+            }
+        }
+        self.compute_geometry(k, &mut cache, rect);
+        cache
+    }
+
+    /// Fill in noise for cells in `r` that are near the coast and lack it.
+    fn fill_bands(&self, k: usize, cache: &mut ShapeCache, r: Rect) {
+        let shape = &self.shapes[k];
+        for cy in r.y0..r.y1 {
+            for cx in r.x0..r.x1 {
+                let idx = cache.index(cx, cy);
+                if cache.nearest[idx] != u32::MAX && cache.bands[idx].big.is_nan() {
+                    let local = shape.frame.to_local(self.cell_center(cx, cy));
+                    cache.bands[idx] = coast_bands(local[0], local[1], shape.coast.seed, self.cell_km);
+                }
+            }
+        }
+    }
+
+    /// Cells within CLAMP_KM of a shape: everything it can influence.
+    fn shape_rect(&self, coast: &Coastline) -> Rect {
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in &coast.points {
+            x0 = x0.min(p[0]);
+            y0 = y0.min(p[1]);
+            x1 = x1.max(p[0]);
+            y1 = y1.max(p[1]);
+        }
+        self.km_box_to_cells(x0 - CLAMP_KM, y0 - CLAMP_KM, x1 + CLAMP_KM, y1 + CLAMP_KM)
+    }
+
+    /// Union of the reach of the flagged segments.
+    fn reach_of(&self, coast: &Coastline, flags: &[bool]) -> Rect {
+        flags
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| **f)
+            .fold(Rect::EMPTY, |r, (i, _)| r.union(self.segment_reach(coast, i)))
+    }
+
     fn segment_reach(&self, coast: &Coastline, i: usize) -> Rect {
         let (a, b) = coast.segment(i);
         self.km_box_to_cells(
@@ -265,11 +420,16 @@ impl Engine {
         let [ox, oy] = self.origin;
         let to_cell = |km: f32, limit: u32| ((km / self.cell_km).floor().max(0.0) as u32).min(limit);
         let to_cell_end = |km: f32, limit: u32| ((km / self.cell_km).ceil().max(0.0) as u32 + 1).min(limit);
-        Rect {
+        let r = Rect {
             x0: to_cell(min_x - ox, self.width),
             y0: to_cell(min_y - oy, self.height),
             x1: to_cell_end(max_x - ox, self.width),
             y1: to_cell_end(max_y - oy, self.height),
+        };
+        if r.is_empty() {
+            Rect::EMPTY
+        } else {
+            r
         }
     }
 
@@ -281,31 +441,33 @@ impl Engine {
         ]
     }
 
-    /// Distance to the coastline and inside/outside, for cells in `r`.
-    fn compute_geometry(&mut self, r: Rect) {
-        let Some(coast) = self.coast.as_ref() else { return };
-        let width = self.width;
+    /// Distance and inside/outside for shape `k`, for cells in `r` (which
+    /// must lie within the cache's rectangle).
+    fn compute_geometry(&self, k: usize, cache: &mut ShapeCache, r: Rect) {
+        if r.is_empty() {
+            return;
+        }
+        let coast = &self.shapes[k].coast;
         for cy in r.y0..r.y1 {
-            let row = (cy * width) as usize;
-            self.dist[row + r.x0 as usize..row + r.x1 as usize].fill(CLAMP_KM);
-            self.nearest[row + r.x0 as usize..row + r.x1 as usize].fill(u32::MAX);
+            for cx in r.x0..r.x1 {
+                let idx = cache.index(cx, cy);
+                cache.dist[idx] = CLAMP_KM;
+                cache.nearest[idx] = u32::MAX;
+            }
         }
 
-        // Each segment visits only the cells it can reach, rather than every
-        // cell testing every segment.
+        // Each segment visits only the cells it can reach.
         for i in 0..coast.len() {
-            let reach = self.segment_reach(coast, i);
-            let (x0, x1) = (reach.x0.max(r.x0), reach.x1.min(r.x1));
-            let (y0, y1) = (reach.y0.max(r.y0), reach.y1.min(r.y1));
+            let reach = self.segment_reach(coast, i).intersect(r);
             let (a, b) = coast.segment(i);
-            for cy in y0..y1 {
-                for cx in x0..x1 {
+            for cy in reach.y0..reach.y1 {
+                for cx in reach.x0..reach.x1 {
                     let (d, t) = distance_to_segment(self.cell_center(cx, cy), a, b);
-                    let idx = (cy * width + cx) as usize;
-                    if d < self.dist[idx] {
-                        self.dist[idx] = d;
-                        self.nearest[idx] = i as u32;
-                        self.along[idx] = t;
+                    let idx = cache.index(cx, cy);
+                    if d < cache.dist[idx] {
+                        cache.dist[idx] = d;
+                        cache.nearest[idx] = i as u32;
+                        cache.along[idx] = t;
                     }
                 }
             }
@@ -332,38 +494,63 @@ impl Engine {
                     inside = !inside;
                     next += 1;
                 }
-                self.inside[(cy * width + cx) as usize] = inside;
+                let idx = cache.index(cx, cy);
+                cache.inside[idx] = inside;
             }
         }
+        self.fill_bands(k, cache, r);
     }
 
-    /// Elevation for cells in `r` from the cached geometry. With `only`, skip
-    /// cells whose nearest segment is not flagged. Returns the cells written.
-    fn compute_terrain(&mut self, r: Rect, only: Option<&[bool]>) -> Rect {
-        let Some(coast) = self.coast.as_ref() else { return Rect::EMPTY };
+    /// Elevation for cells in `r`, combining every shape that reaches each
+    /// cell. With `only`, skip cells whose nearest segment of that shape is
+    /// not flagged. Returns the cells written.
+    fn compute_terrain(&mut self, r: Rect, only: Option<(usize, &[bool])>) -> Rect {
         let far = SegmentParams::default();
         let mut written = Rect::EMPTY;
         for cy in r.y0..r.y1 {
             let mut row_min = u32::MAX;
             let mut row_max = 0;
             for cx in r.x0..r.x1 {
-                let idx = (cy * self.width + cx) as usize;
-                let seg = self.nearest[idx];
-                if let Some(flags) = only {
+                if let Some((k, flags)) = only {
+                    let cache = &self.caches[k];
+                    if !cache.rect.contains(cx, cy) {
+                        continue;
+                    }
+                    let seg = cache.nearest[cache.index(cx, cy)];
                     if seg == u32::MAX || !flags[seg as usize] {
                         continue;
                     }
                 }
-                let d = self.dist[idx];
-                let signed = if self.inside[idx] { d } else { -d };
-                let base = self.base[idx];
-                self.elevation[idx] = if seg != u32::MAX {
-                    let params = coast.params_at(seg as usize, self.along[idx]);
-                    let shifted = signed + coastal_displacement(&self.bands[idx], &params);
-                    elevation_from_coast(base, shifted, &params)
+                let idx = (cy * self.width + cx) as usize;
+                // Union: the shape that puts this cell furthest inland wins.
+                let mut best = -CLAMP_KM;
+                let mut best_params = far;
+                let mut any = false;
+                for (shape, cache) in self.shapes.iter().zip(&self.caches) {
+                    if !cache.rect.contains(cx, cy) {
+                        continue;
+                    }
+                    let c = cache.index(cx, cy);
+                    let d = cache.dist[c];
+                    let signed = if cache.inside[c] { d } else { -d };
+                    let seg = cache.nearest[c];
+                    let (shifted, params) = if seg != u32::MAX {
+                        let params = shape.coast.params_at(seg as usize, cache.along[c]);
+                        (signed + coastal_displacement(&cache.bands[c], &params), params)
+                    } else {
+                        // Too far from any segment for its parameters to matter.
+                        (signed, far)
+                    };
+                    if !any || shifted > best {
+                        best = shifted;
+                        best_params = params;
+                        any = true;
+                    }
+                }
+                self.elevation[idx] = if any {
+                    elevation_from_coast(self.base[idx], best, &best_params)
                 } else {
-                    // Too far from any segment for its parameters to matter.
-                    elevation_from_coast(base, signed, &far)
+                    EMPTY_ELEVATION
                 };
                 row_min = row_min.min(cx);
                 row_max = row_max.max(cx);

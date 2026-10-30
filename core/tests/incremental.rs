@@ -108,3 +108,105 @@ fn window_lines_up_with_the_whole_map() {
         }
     }
 }
+
+// --- multiple shapes ----------------------------------------------------------
+
+use terrain_core::{Frame, Shape};
+
+fn island(id: u32, cx: f32, cy: f32, r: f32, seed: u32) -> Shape {
+    let points: Vec<[f32; 2]> = (0..7)
+        .map(|i| {
+            let a = i as f32 / 7.0 * std::f32::consts::TAU;
+            [cx + r * a.cos(), cy + r * 0.8 * a.sin()]
+        })
+        .collect();
+    let params = points.iter().map(|_| SegmentParams::default()).collect();
+    Shape { id, coast: Coastline { points, params, seed }, frame: Frame { x: cx, y: cy, angle: 0.0 } }
+}
+
+fn world(shapes: &[Shape]) -> Engine {
+    let mut e = Engine::new(SIZE, SIZE, EXTENT_KM);
+    e.set_shapes(99, shapes.to_vec());
+    e
+}
+
+fn archipelago() -> Vec<Shape> {
+    vec![island(1, 450.0, 500.0, 260.0, 11), island(2, 1100.0, 600.0, 300.0, 22), island(3, 800.0, 1200.0, 180.0, 33)]
+}
+
+#[test]
+fn overlapping_shapes_stay_land() {
+    // Two overlapping islands: the overlap must be land, not cancelled out.
+    let shapes = vec![island(1, 700.0, 800.0, 300.0, 1), island(2, 900.0, 800.0, 300.0, 2)];
+    let e = world(&shapes);
+    let cell = EXTENT_KM / SIZE as f32;
+    let at = |x: f32, y: f32| e.elevation()[((y / cell) as u32 * SIZE + (x / cell) as u32) as usize];
+    assert!(at(800.0, 800.0) > 0.0, "overlap should be land");
+}
+
+#[test]
+fn shape_edits_match_full_regeneration() {
+    let mut shapes = archipelago();
+    let mut live = world(&shapes);
+
+    shapes[1].coast.params[3].coves = 1.0; // slider
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+
+    shapes[0].coast.points[2][0] += 25.0; // drag a point
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+
+    shapes[0].coast.points[2][0] += 400.0; // drag it far, so the shape's reach grows
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+
+    shapes.push(island(4, 300.0, 1300.0, 120.0, 44)); // add a shape
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+
+    shapes.remove(2); // delete a shape
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+
+    for p in shapes[1].coast.points.iter_mut() {
+        p[0] -= 60.0; // move a whole shape
+        p[1] += 35.0;
+    }
+    shapes[1].frame.x -= 60.0;
+    shapes[1].frame.y += 35.0;
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+
+    live.set_shapes(99, Vec::new()); // clear everything
+    assert_same(&live, &Engine::new(SIZE, SIZE, EXTENT_KM));
+}
+
+#[test]
+fn moving_a_shape_keeps_its_coastline() {
+    // Move an island by a whole number of cells: its outline (where land
+    // meets sea) must move with it unchanged.
+    let cell = EXTENT_KM / SIZE as f32;
+    let (dx, dy) = (40u32, 25u32);
+    let a = island(1, 600.0, 600.0, 250.0, 5);
+    let mut b = a.clone();
+    for p in b.coast.points.iter_mut() {
+        p[0] += dx as f32 * cell;
+        p[1] += dy as f32 * cell;
+    }
+    b.frame.x += dx as f32 * cell;
+    b.frame.y += dy as f32 * cell;
+    let ea = world(&[a]);
+    let eb = world(&[b]);
+    let (mut same, mut total) = (0u32, 0u32);
+    for y in 0..SIZE - dy {
+        for x in 0..SIZE - dx {
+            let la = ea.elevation()[(y * SIZE + x) as usize] > 0.0;
+            let lb = eb.elevation()[((y + dy) * SIZE + x + dx) as usize] > 0.0;
+            total += 1;
+            same += (la == lb) as u32;
+        }
+    }
+    let mismatch = total - same;
+    assert!(mismatch < 20, "{mismatch} cells changed between land and sea");
+}

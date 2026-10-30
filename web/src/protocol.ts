@@ -11,10 +11,20 @@ export interface SegmentParams {
   shoreKm: number; // 0.1..30
 }
 
-export interface CoastGuide {
+/** One shape as the core sees it. */
+export interface GuideShape {
+  id: number;
+  seed: number;
+  /** Anchors the coastline detail: position (km) and rotation (radians). */
+  frame: { x: number; y: number; angle: number };
   points: Vec2[];
   params: SegmentParams[]; // params[i] belongs to the segment from points[i] to points[i + 1]
-  seed: number;
+}
+
+/** Everything the core generates from. */
+export interface Guides {
+  worldSeed: number;
+  shapes: GuideShape[];
 }
 
 export const DEFAULT_PARAMS: Readonly<SegmentParams> = { roughness: 0.4, coves: 0.5, shoreKm: 4 };
@@ -35,28 +45,32 @@ export type ToCore =
       originX: number;
       originY: number;
     }
-  | { type: "coast"; version: number; coast: CoastGuide | null };
+  | { type: "guides"; version: number; guides: Guides };
 
 export type FromCore =
   | { type: "frame"; version: number; rect: Rect; pixels: ArrayBuffer; computeMs: number }
   | { type: "error"; version: number; message: string };
 
 /** Flat encoding the core reads; see core/src/ffi.rs. */
-export function encodeCoast(coast: CoastGuide | null): Float32Array {
-  if (!coast || coast.points.length < 3) return new Float32Array([0, 0]);
-  const n = coast.points.length;
-  const out = new Float32Array(2 + n * 5);
-  out[0] = coast.seed;
-  out[1] = n;
-  coast.points.forEach((p, i) => {
-    out[2 + i * 2] = p.x;
-    out[3 + i * 2] = p.y;
-  });
-  coast.params.forEach((p, i) => {
-    const at = 2 + n * 2 + i * 3;
-    out[at] = p.roughness;
-    out[at + 1] = p.coves;
-    out[at + 2] = p.shoreKm;
-  });
+export function encodeGuides(guides: Guides): Float32Array {
+  const shapes = guides.shapes.filter((s) => s.points.length >= 3);
+  const size = 2 + shapes.reduce((n, s) => n + 6 + s.points.length * 5, 0);
+  const out = new Float32Array(size);
+  out[0] = guides.worldSeed;
+  out[1] = shapes.length;
+  let at = 2;
+  for (const s of shapes) {
+    out.set([s.id, s.seed, s.frame.x, s.frame.y, s.frame.angle, s.points.length], at);
+    at += 6;
+    for (const p of s.points) {
+      out[at++] = p.x;
+      out[at++] = p.y;
+    }
+    for (const p of s.params) {
+      out[at++] = p.roughness;
+      out[at++] = p.coves;
+      out[at++] = p.shoreKm;
+    }
+  }
   return out;
 }

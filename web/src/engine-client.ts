@@ -8,8 +8,7 @@
 import { CoreHost } from "./core-host";
 import type { FromCore, Guides, Rect, ToCore } from "./protocol";
 
-declare const __WORKER_SOURCE__: string;
-declare const __WASM_BASE64__: string;
+import { WORKER_SOURCE, wasmBytes } from "./embedded";
 
 export interface Frame {
   rect: Rect;
@@ -21,11 +20,6 @@ export interface Frame {
   initVersion: number;
 }
 
-let wasmBytes: Uint8Array | null = null;
-function wasm(): ArrayBuffer {
-  if (!wasmBytes) wasmBytes = Uint8Array.from(atob(__WASM_BASE64__), (c) => c.charCodeAt(0));
-  return wasmBytes.slice().buffer;
-}
 
 export class EngineClient {
   onFrame: (frame: Frame) => void = () => {};
@@ -45,7 +39,7 @@ export class EngineClient {
 
   constructor() {
     try {
-      const url = URL.createObjectURL(new Blob([__WORKER_SOURCE__], { type: "text/javascript" }));
+      const url = URL.createObjectURL(new Blob([WORKER_SOURCE], { type: "text/javascript" }));
       this.worker = new Worker(url);
       this.worker.onmessage = (e: MessageEvent<FromCore>) => this.receive(e.data);
       this.worker.onerror = () => this.useMainThread();
@@ -86,7 +80,7 @@ export class EngineClient {
     else this.waitingGuides = null;
     this.inFlight = next;
     this.sentAt.set(next.version, performance.now());
-    const msg = next.type === "init" ? { ...next, wasm: wasm() } : next;
+    const msg = next.type === "init" ? { ...next, wasm: wasmBytes() } : next;
     if (this.worker) {
       this.worker.postMessage(msg, msg.type === "init" ? [msg.wasm] : []);
     } else {

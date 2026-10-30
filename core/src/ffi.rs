@@ -5,12 +5,13 @@
 //! The app then reads those pixels straight out of WebAssembly memory.
 //!
 //! Guide encoding (all f32):
-//!   [world_seed, shape_count, shape...]
+//!   [world_seed, edge_smoothing_px, shape_count, shape...]
 //! and each shape is
-//!   [id, seed, frame_x, frame_y, frame_angle, n,
-//!    x0, y0, ..., x(n-1), y(n-1), r0, c0, s0, ..., r(n-1), c(n-1), s(n-1)]
-//! where x/y are kilometres, r = roughness, c = coves, s = shore distance (km)
-//! and the frame anchors the shape's coastline detail. Seeds and ids must be
+//!   [id, seed, frame_x, frame_y, frame_angle, frame_scale, water, n,
+//!    x0, y0, ..., x(n-1), y(n-1), then per segment r, c, s, g, i]
+//! where x/y are kilometres, r = roughness, c = coves, s = shore distance (km),
+//! g = reach outside the line (km), i = reach inside the line (km), water is 1 for a lake or sea and 0 for land, and the
+//! frame anchors the shape's coastline detail. Shapes combine in list order. Seeds and ids must be
 //! below 2^24 so they survive the trip through f32 exactly.
 
 use std::cell::RefCell;
@@ -58,8 +59,8 @@ pub extern "C" fn wm_inbox(len: u32) -> *mut f32 {
 /// Apply the guides in the inbox. Returns the number of changed pixels.
 #[no_mangle]
 pub extern "C" fn wm_set_shapes(len: u32) -> u32 {
-    let (seed, shapes) = INBOX.with(|b| decode_shapes(&b.borrow()[..len as usize]));
-    let dirty = with_engine(|e| e.set_shapes(seed, shapes));
+    let (seed, smoothing, shapes) = INBOX.with(|b| decode_shapes(&b.borrow()[..len as usize]));
+    let dirty = with_engine(|e| e.set_smoothing(smoothing).union(e.set_shapes(seed, shapes)));
     DIRTY.with(|d| *d.borrow_mut() = dirty);
     dirty.cells() as u32
 }
@@ -88,39 +89,41 @@ pub extern "C" fn wm_elevation() -> *const f32 {
     with_engine(|e| e.elevation().as_ptr())
 }
 
-fn decode_shapes(data: &[f32]) -> (u32, Vec<Shape>) {
+fn decode_shapes(data: &[f32]) -> (u32, f32, Vec<Shape>) {
     let mut shapes = Vec::new();
-    if data.len() < 2 {
-        return (0, shapes);
+    if data.len() < 3 {
+        return (0, 0.0, shapes);
     }
     let seed = data[0] as u32;
-    let count = data[1] as usize;
-    let mut at = 2;
+    let smoothing = data[1];
+    let count = data[2] as usize;
+    let mut at = 3;
     for _ in 0..count {
-        if data.len() < at + 6 {
+        if data.len() < at + 8 {
             break;
         }
-        let head = &data[at..at + 6];
-        let n = head[5] as usize;
-        let body = at + 6;
-        if data.len() < body + n * 5 {
+        let head = &data[at..at + 8];
+        let n = head[7] as usize;
+        let body = at + 8;
+        if data.len() < body + n * 7 {
             break;
         }
         let pts = &data[body..body + n * 2];
-        let prm = &data[body + n * 2..body + n * 5];
+        let prm = &data[body + n * 2..body + n * 7];
         shapes.push(Shape {
             id: head[0] as u32,
-            frame: Frame { x: head[2], y: head[3], angle: head[4] },
+            frame: Frame { x: head[2], y: head[3], angle: head[4], scale: head[5] },
+            water: head[6] != 0.0,
             coast: Coastline {
                 points: pts.chunks_exact(2).map(|p| [p[0], p[1]]).collect(),
                 params: prm
-                    .chunks_exact(3)
-                    .map(|p| SegmentParams { roughness: p[0], coves: p[1], shore_km: p[2] })
+                    .chunks_exact(5)
+                    .map(|p| SegmentParams { roughness: p[0], coves: p[1], shore_km: p[2], reach_km: p[3], inside_km: p[4] })
                     .collect(),
                 seed: head[1] as u32,
             },
         });
-        at = body + n * 5;
+        at = body + n * 7;
     }
-    (seed, shapes)
+    (seed, smoothing, shapes)
 }

@@ -28,7 +28,7 @@
       <div class="actions">
         <button id="generate" class="primary" disabled>Generate landmass</button>
         <button id="clear" class="quiet" disabled>Clear all shapes</button>
-        <button id="export" class="quiet" disabled>Export PNG</button>
+        <button id="export" class="quiet" disabled>Export PNG…</button>
         <p id="export-status" class="hint" aria-live="polite"></p>
       </div>
     </aside>
@@ -62,6 +62,17 @@
           <div class="field-head"><label for="shape-name">Name</label></div>
           <input id="shape-name" type="text" maxlength="60" autocomplete="off">
         </div>
+        <div class="field">
+          <div class="field-head"><span id="kind-label">Kind</span></div>
+          <div class="segmented" role="group" aria-labelledby="kind-label">
+            <button id="kind-land" aria-pressed="true">Land</button>
+            <button id="kind-water" aria-pressed="false">Water</button>
+          </div>
+          <p class="hint">Water shapes become lakes, seas and bays. Land drawn inside water becomes an island.</p>
+        </div>
+        <h3 class="subhead">Coastline, all segments</h3>
+        <p class="hint subhead-hint">Changes every segment. Segments you've adjusted keep their own difference on top.</p>
+        <div id="shape-sliders"></div>
         <p id="shape-facts" class="hint"></p>
         <p id="shape-help" class="hint"></p>
         <button id="delete-shape" class="quiet danger">Delete shape</button>
@@ -70,22 +81,8 @@
       <section id="segment-panel" class="block" hidden>
         <h2 id="segment-title">Segment</h2>
         <p id="segment-shape" class="hint segment-shape"></p>
-        <div class="field">
-          <div class="field-head"><label for="roughness">Roughness</label><output id="roughness-value"></output></div>
-          <input id="roughness" type="range" min="0" max="100" step="1">
-          <p class="hint">Fine jaggedness along the shore.</p>
-        </div>
-        <div class="field">
-          <div class="field-head"><label for="coves">Coves and bays</label><output id="coves-value"></output></div>
-          <input id="coves" type="range" min="0" max="100" step="1">
-          <p class="hint">A smooth coast at 0, many inlets and headlands at 100.</p>
-        </div>
-        <div class="field">
-          <div class="field-head"><label for="shore">Shore slope</label><output id="shore-value"></output></div>
-          <input id="shore" type="range" min="0" max="1000" step="1">
-          <p class="hint">How far inland the land takes to rise. Short makes cliffs, long makes gentle beaches.</p>
-        </div>
-        <button id="apply-all" class="quiet">Apply to all segments</button>
+        <div id="segment-sliders"></div>
+        <button id="reset-segment" class="quiet">Reset to shape values</button>
       </section>
 
       <section id="point-panel" class="block" hidden>
@@ -104,6 +101,11 @@
             <option value="2048">2048 × 2048 (0.8 km per pixel)</option>
           </select>
         </div>
+        <div class="field">
+          <div class="field-head"><label for="smoothing">Edge smoothing</label><output id="smoothing-value"></output></div>
+          <input id="smoothing" type="range" min="0" max="3" step="0.25" value="1">
+          <p class="hint">Anti-aliasing for coastlines: softens jagged pixel edges on the map and in exports.</p>
+        </div>
         <p class="hint">The map is 1,600 km across. Scroll or pinch to zoom; zoomed views are regenerated at full detail. Drag empty map, or hold Space and drag, to pan.</p>
       </section>
 
@@ -113,6 +115,36 @@
       </section>
     </aside>
   </div>
+  <dialog id="export-dialog" class="export-dialog" aria-labelledby="export-title">
+    <h2 id="export-title">Export PNG</h2>
+    <div class="choices" role="radiogroup" aria-label="Export detail">
+      <label class="choice">
+        <input type="radio" name="export-mode" value="quick" checked>
+        <span><span class="choice-name">Quick</span><span id="quick-hint" class="hint"></span></span>
+      </label>
+      <label class="choice">
+        <input type="radio" name="export-mode" value="full">
+        <span><span class="choice-name">Full detail</span><span class="hint">The whole map regenerated at high resolution, with the same detail you see when zoomed in.</span></span>
+      </label>
+    </div>
+    <div id="full-options" class="field" hidden>
+      <div class="field-head"><label for="full-size">Size</label></div>
+      <select id="full-size">
+        <option value="4096">4096 × 4096 (390 m per pixel)</option>
+        <option value="8192" selected>8192 × 8192 (195 m per pixel)</option>
+        <option value="16384">16384 × 16384 (98 m per pixel)</option>
+      </select>
+      <p id="full-estimate" class="hint"></p>
+    </div>
+    <div id="export-progress" hidden>
+      <progress id="export-bar" max="1" value="0"></progress>
+      <p id="export-progress-text" class="hint" aria-live="polite"></p>
+    </div>
+    <div class="dialog-actions">
+      <button id="export-cancel" class="quiet">Cancel</button>
+      <button id="export-go" class="primary">Export</button>
+    </div>
+  </dialog>
   <script><!-- SCRIPT --></script>
 </body>
 </html>

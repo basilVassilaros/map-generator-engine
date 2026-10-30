@@ -17,6 +17,10 @@ pub const CLAMP_KM: f32 = INFLUENCE_KM + MAX_COAST_NOISE_KM;
 /// which must stay below INFLUENCE_KM.
 pub const MIN_SHORE_KM: f32 = 0.1;
 pub const MAX_SHORE_KM: f32 = 30.0;
+/// How far (km) a coastline may grow beyond the drawn line. Together with the
+/// roughness detail it must stay within MAX_COAST_NOISE_KM.
+pub const MAX_REACH_KM: f32 = 70.0;
+const ROUGH_KM: f32 = 12.0;
 
 /// Parameters the user sets on one segment of the coastline.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,11 +32,16 @@ pub struct SegmentParams {
     /// Kilometres over which land rises from the shoreline.
     /// Short gives cliffs, long gives a gradual beach.
     pub shore_km: f32,
+    /// How far (km) the coast may grow beyond the drawn line.
+    pub reach_km: f32,
+    /// How far (km) the coast may cut inside the drawn line. At zero the drawn
+    /// line is the inner edge, so everything drawn keeps its kind.
+    pub inside_km: f32,
 }
 
 impl Default for SegmentParams {
     fn default() -> Self {
-        Self { roughness: 0.4, coves: 0.5, shore_km: 4.0 }
+        Self { roughness: 0.4, coves: 0.5, shore_km: 4.0, reach_km: 25.0, inside_km: 0.0 }
     }
 }
 
@@ -42,6 +51,8 @@ impl SegmentParams {
             roughness: self.roughness.clamp(0.0, 1.0),
             coves: self.coves.clamp(0.0, 1.0),
             shore_km: self.shore_km.clamp(MIN_SHORE_KM, MAX_SHORE_KM),
+            reach_km: self.reach_km.clamp(0.0, MAX_REACH_KM),
+            inside_km: self.inside_km.clamp(0.0, MAX_REACH_KM),
         }
     }
 
@@ -50,6 +61,8 @@ impl SegmentParams {
             roughness: a.roughness + (b.roughness - a.roughness) * t,
             coves: a.coves + (b.coves - a.coves) * t,
             shore_km: a.shore_km + (b.shore_km - a.shore_km) * t,
+            reach_km: a.reach_km + (b.reach_km - a.reach_km) * t,
+            inside_km: a.inside_km + (b.inside_km - a.inside_km) * t,
         }
     }
 }
@@ -63,24 +76,56 @@ pub struct Coastline {
     pub seed: u32,
 }
 
-/// Where a shape's coastline detail is anchored: a position (km) and a
-/// rotation (radians). Moving or rotating a shape moves its frame with it, so
-/// the coves and headlands travel with the shape instead of changing.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// Where a shape's coastline detail is anchored: a position (km), a rotation
+/// (radians) and a scale. Moving, rotating or resizing a shape transforms its
+/// frame with it, so the coves and headlands move, turn and grow with the
+/// shape: its coastline only changes when points move relative to each other.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frame {
     pub x: f32,
     pub y: f32,
     pub angle: f32,
+    /// 1 when drawn; resizing the shape multiplies it.
+    pub scale: f32,
 }
 
+impl Default for Frame {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, angle: 0.0, scale: 1.0 }
+    }
+}
+
+/// Coastline detail scales with its shape only within this range, so a
+/// shape shrunk to a speck or grown past the map stays manageable.
+pub const MIN_DETAIL_SCALE: f32 = 0.125;
+pub const MAX_DETAIL_SCALE: f32 = 8.0;
+
 impl Frame {
-    /// World position (km) to the shape's own coordinates.
+    /// How much the shape's coastline detail is scaled.
+    #[inline]
+    pub fn detail_scale(&self) -> f32 {
+        if self.scale.is_finite() {
+            self.scale.clamp(MIN_DETAIL_SCALE, MAX_DETAIL_SCALE)
+        } else {
+            1.0
+        }
+    }
+
+    /// World position (km) to the shape's own coordinates, as drawn.
     #[inline]
     pub fn to_local(&self, p: [f32; 2]) -> [f32; 2] {
         let (s, c) = (-self.angle).sin_cos();
+        let k = 1.0 / self.detail_scale();
         let dx = p[0] - self.x;
         let dy = p[1] - self.y;
-        [c * dx - s * dy, s * dx + c * dy]
+        [(c * dx - s * dy) * k, (s * dx + c * dy) * k]
+    }
+
+    /// The furthest (km) this shape's coast can stray from its outline, plus
+    /// how far coastal effects reach: beyond this, the shape changes nothing.
+    #[inline]
+    pub fn clamp_km(&self) -> f32 {
+        INFLUENCE_KM + MAX_COAST_NOISE_KM * self.detail_scale()
     }
 }
 
@@ -91,6 +136,8 @@ pub struct Shape {
     pub id: u32,
     pub coast: Coastline,
     pub frame: Frame,
+    /// Water shapes (lakes, seas) cut water out of land instead of adding land.
+    pub water: bool,
 }
 
 /// Fraction of each segment at either end that blends into the neighbouring
@@ -188,19 +235,29 @@ pub fn coast_bands(x: f32, y: f32, seed: u32, cell_km: f32) -> CoastBands {
     }
 }
 
-/// How far (km) the shoreline is pushed at a position. Positive pushes land
-/// outwards. Always strictly within +/- MAX_COAST_NOISE_KM.
+/// How far (km) the shoreline is pushed beyond the drawn line at a position
+/// (negative pulls it inside). Ranges from `-inside_km` to `reach_km` plus
+/// roughness. With `inside_km` at zero it is never negative: the drawn line is
+/// the inner edge, so everything inside a shape keeps its kind. Always within
+/// +/- MAX_COAST_NOISE_KM.
 pub fn coastal_displacement(b: &CoastBands, p: &SegmentParams) -> f32 {
     let c = p.coves;
-    // Raising "coves" deepens every band, the shorter ones most, so the coast
-    // gains inlets and headlands rather than just getting larger wiggles.
-    let raw = 2.2
-        * ((25.0 + 35.0 * c) * b.big
-            + (8.0 + 40.0 * c) * b.mid
-            + (3.0 + 22.0 * c) * b.small
-            + 12.0 * p.roughness * b.rough);
-    // Soft limit: keeps the bound without flattening the extremes into plateaus.
-    MAX_COAST_NOISE_KM * (raw / MAX_COAST_NOISE_KM).tanh()
+    // The broad shape of the coast. Raising "coves" shifts the mix towards
+    // shorter wavelengths and sharpens the contrast, so the coast alternates
+    // between headlands at full reach and inlets back towards the line.
+    let mix = (0.6 - 0.25 * c) * b.big + (0.3 + 0.15 * c) * b.mid + (0.1 + 0.3 * c) * b.small;
+    let t = (mix * (3.5 + 5.0 * c)).tanh();
+    // Outward and inward growth mirror each other, each biased towards the
+    // line (x^1.5), so the coast hugs the line and departs from it in
+    // distinct headlands and inlets rather than as an even band.
+    let x = 0.5 * (t + 1.0);
+    let y = 1.0 - x;
+    let body = p.reach_km * x * x.sqrt() - p.inside_km * y * y.sqrt();
+    // Roughness adds fine, jagged detail everywhere, including along stretches
+    // that sit right on the line. It only ever pushes outward, so it never
+    // breaks the inside guarantee.
+    let rough = p.roughness * ROUGH_KM * 0.5 * (b.rough.clamp(-1.0, 1.0) + 1.0);
+    (body + rough).clamp(-MAX_COAST_NOISE_KM, MAX_COAST_NOISE_KM)
 }
 
 /// Elevation (metres) for a cell `signed_km` from the shoreline
@@ -239,9 +296,9 @@ mod tests {
         let coast = Coastline {
             points: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]],
             params: vec![
-                SegmentParams { roughness: 0.0, coves: 0.0, shore_km: 1.0 },
-                SegmentParams { roughness: 1.0, coves: 1.0, shore_km: 20.0 },
-                SegmentParams { roughness: 0.5, coves: 0.2, shore_km: 5.0 },
+                SegmentParams { roughness: 0.0, coves: 0.0, shore_km: 1.0, reach_km: 0.0, inside_km: 0.0 },
+                SegmentParams { roughness: 1.0, coves: 1.0, shore_km: 20.0, reach_km: 70.0, inside_km: 40.0 },
+                SegmentParams { roughness: 0.5, coves: 0.2, shore_km: 5.0, reach_km: 30.0, inside_km: 10.0 },
             ],
             seed: 1,
         };
@@ -255,11 +312,16 @@ mod tests {
 
     #[test]
     fn displacement_is_bounded() {
-        let p = SegmentParams { roughness: 1.0, coves: 1.0, shore_km: 30.0 };
+        let out = SegmentParams { roughness: 1.0, coves: 1.0, shore_km: 30.0, reach_km: MAX_REACH_KM, inside_km: 0.0 };
+        let both = SegmentParams { inside_km: MAX_REACH_KM, ..out };
         for i in 0..50_000 {
             let bands = coast_bands(i as f32 * 0.91, i as f32 * 1.37, 3, 0.05);
-            assert!(coastal_displacement(&bands, &p).abs() <= MAX_COAST_NOISE_KM);
+            let d = coastal_displacement(&bands, &out);
+            assert!((0.0..=MAX_COAST_NOISE_KM).contains(&d), "outward only: {d}");
+            let d = coastal_displacement(&bands, &both);
+            assert!((-MAX_REACH_KM..=MAX_COAST_NOISE_KM).contains(&d), "both ways: {d}");
         }
+        assert!(MAX_REACH_KM + ROUGH_KM <= MAX_COAST_NOISE_KM);
     }
 
     #[test]
@@ -273,8 +335,8 @@ mod tests {
     fn profile_is_flat_beyond_influence() {
         // Required for exact partial updates: every parameter must stop
         // mattering once a cell is INFLUENCE_KM from the shore.
-        let lo = SegmentParams { roughness: 0.0, coves: 0.0, shore_km: MIN_SHORE_KM };
-        let hi = SegmentParams { roughness: 1.0, coves: 1.0, shore_km: MAX_SHORE_KM };
+        let lo = SegmentParams { roughness: 0.0, coves: 0.0, shore_km: MIN_SHORE_KM, reach_km: 0.0, inside_km: 0.0 };
+        let hi = SegmentParams { roughness: 1.0, coves: 1.0, shore_km: MAX_SHORE_KM, reach_km: MAX_REACH_KM, inside_km: MAX_REACH_KM };
         for d in [INFLUENCE_KM, INFLUENCE_KM + 10.0, CLAMP_KM] {
             assert_eq!(elevation_from_coast(300.0, d, &lo), elevation_from_coast(300.0, d, &hi));
             assert_eq!(elevation_from_coast(300.0, -d, &lo), elevation_from_coast(300.0, -d, &hi));

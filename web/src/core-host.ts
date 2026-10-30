@@ -30,6 +30,7 @@ export class CoreHost {
         this.width = msg.width;
         return this.frame(msg.version, [0, 0, msg.width, msg.height], started);
       }
+      if (msg.type === "strip") return await this.strip(msg, started);
       const core = this.require();
       const data = encodeGuides(msg.guides);
       const ptr = core.wm_inbox(data.length);
@@ -40,6 +41,30 @@ export class CoreHost {
     } catch (err) {
       return { type: "error", version: msg.version, message: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  /**
+   * One strip of a full-detail export: the rows from `originY` down, with an
+   * extra row above and below so hillshading at the strip's edges matches
+   * its neighbours. Returns only the strip's own rows.
+   */
+  private async strip(msg: Extract<ToCore, { type: "strip" }>, started: number): Promise<FromCore> {
+    if (!this.core) {
+      if (!msg.wasm) throw new Error("The export worker needs the core.");
+      const { instance } = await WebAssembly.instantiate(msg.wasm, {});
+      this.core = instance.exports as unknown as CoreExports;
+    }
+    const core = this.core;
+    const cell = msg.widthKm / msg.width;
+    if (!core.wm_init(msg.width, msg.rows + 2, msg.widthKm, 0, msg.originY - cell)) {
+      throw new Error("The core rejected an export strip.");
+    }
+    this.width = msg.width;
+    const data = encodeGuides(msg.guides);
+    const ptr = core.wm_inbox(data.length);
+    new Float32Array(core.memory.buffer, ptr, data.length).set(data);
+    core.wm_set_shapes(data.length);
+    return this.frame(msg.version, [0, 1, msg.width, msg.rows + 1], started);
   }
 
   private require(): CoreExports {

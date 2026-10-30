@@ -40,8 +40,16 @@ fn tint(elevation: f32) -> [f32; 3] {
     RAMP[RAMP.len() - 1].1
 }
 
-/// Colour and shade the pixels in `r`.
-pub fn shade(elevation: &[f32], rgba: &mut [u8], width: u32, height: u32, cell_m: f32, r: Rect) {
+/// Colour and shade the pixels in `r`. `shore` is each cell's signed
+/// distance (km) to the coastline, positive on land. With `blend_km` above
+/// zero, land and water colours are blended across that width around the
+/// coastline, which smooths the stair-stepped edge without supersampling.
+#[allow(clippy::too_many_arguments)]
+pub fn shade(elevation: &[f32], shore: &[f32], rgba: &mut [u8], width: u32, height: u32, cell_km: f32, blend_km: f32, r: Rect) {
+    let cell_m = cell_km * 1000.0;
+    // What each side of the coastline looks like right at the edge.
+    let beach = tint(1.0);
+    let shallows = tint(-15.0);
     const EXAGGERATION: f32 = 4.0;
     // Light from the north-west, 45 degrees up (y grows southwards).
     let light = {
@@ -75,7 +83,18 @@ pub fn shade(elevation: &[f32], rgba: &mut [u8], width: u32, height: u32, cell_m
             let strength = if underwater { 0.0 } else { 0.65 };
             let factor = 1.0 + (relative - 1.0) * strength;
 
-            let c = tint(e);
+            let mut c = tint(e);
+            if blend_km > 0.0 {
+                // How much of this pixel lies on land, from its distance to the coast.
+                let d = shore[cy as usize * width as usize + cx as usize];
+                let land = (0.5 + d / blend_km).clamp(0.0, 1.0);
+                let (other, amount) = if underwater { (beach, land) } else { (shallows, 1.0 - land) };
+                if amount > 0.0 {
+                    for k in 0..3 {
+                        c[k] += (other[k] - c[k]) * amount;
+                    }
+                }
+            }
             let i = (cy as usize * width as usize + cx as usize) * 4;
             rgba[i] = (c[0] * factor).clamp(0.0, 255.0) as u8;
             rgba[i + 1] = (c[1] * factor).clamp(0.0, 255.0) as u8;

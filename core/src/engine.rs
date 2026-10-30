@@ -5,12 +5,14 @@
 //! the change can affect, and regenerates only those. Results are identical
 //! to regenerating the whole map; `tests/incremental.rs` holds it to that.
 //!
-//! Shapes combine as a union: a cell is land if it is land for any shape, and
-//! where shapes overlap the one reaching furthest inland decides the terrain.
+//! Shapes combine in list order, starting from open ocean: a land shape adds
+//! land, a water shape cuts water out of whatever came before it. The app
+//! orders shapes by nesting, so a lake inside a continent cuts into it and an
+//! island inside that lake adds land back.
 
 use crate::coast::{
     coast_bands, coastal_displacement, distance_to_segment, elevation_from_coast, inland_base,
-    CoastBands, Coastline, SegmentParams, Shape, CLAMP_KM,
+    CoastBands, Coastline, Frame, SegmentParams, Shape, CLAMP_KM,
 };
 use crate::render;
 
@@ -110,11 +112,11 @@ struct ShapeCache {
 const MISSING: CoastBands = CoastBands { big: f32::NAN, mid: 0.0, small: 0.0, rough: 0.0 };
 
 impl ShapeCache {
-    fn new(rect: Rect) -> Self {
+    fn new(rect: Rect, clamp: f32) -> Self {
         let n = rect.cells() as usize;
         Self {
             rect,
-            dist: vec![CLAMP_KM; n],
+            dist: vec![clamp; n],
             nearest: vec![u32::MAX; n],
             along: vec![0.0; n],
             inside: vec![false; n],
@@ -143,7 +145,12 @@ pub struct Engine {
     origin: [f32; 2],
     cell_km: f32,
     elevation: Vec<f32>,
+    /// Signed distance (km) to the final coastline: positive on land. Lets the
+    /// renderer blend land and water across the edge (edge smoothing).
+    shore: Vec<f32>,
     rgba: Vec<u8>,
+    /// Width (pixels) of the land/water blend along coastlines. 0 = off.
+    smoothing: f32,
     world_seed: u32,
     /// Lowland height, anchored to the world. Depends only on the world seed.
     base: Vec<f32>,
@@ -171,7 +178,9 @@ impl Engine {
             origin,
             cell_km,
             elevation: vec![EMPTY_ELEVATION; cells],
+            shore: vec![-CLAMP_KM; cells],
             rgba: vec![0; cells * 4],
+            smoothing: 0.0,
             world_seed: 0,
             base: Vec::new(),
             base_seed: None,
@@ -202,6 +211,19 @@ impl Engine {
         &self.shapes
     }
 
+    /// Set the edge smoothing width in pixels. Only recolours: the terrain is
+    /// unchanged. Returns the pixels that changed.
+    pub fn set_smoothing(&mut self, pixels: f32) -> Rect {
+        let pixels = if pixels.is_finite() { pixels.clamp(0.0, 4.0) } else { 0.0 };
+        if pixels == self.smoothing {
+            return Rect::EMPTY;
+        }
+        self.smoothing = pixels;
+        let all = self.full_rect();
+        self.shade(all);
+        all
+    }
+
     pub fn full_rect(&self) -> Rect {
         Rect { x0: 0, y0: 0, x1: self.width, y1: self.height }
     }
@@ -209,7 +231,7 @@ impl Engine {
     /// Convenience for a single coastline (id 0, frame at the origin).
     pub fn set_coast(&mut self, coast: Option<Coastline>) -> Rect {
         let seed = coast.as_ref().map_or(0, |c| c.seed);
-        let shapes = coast.into_iter().map(|c| Shape { id: 0, coast: c, frame: Default::default() }).collect();
+        let shapes = coast.into_iter().map(|c| Shape { id: 0, coast: c, frame: Default::default(), water: false }).collect();
         self.set_shapes(seed, shapes)
     }
 
@@ -259,6 +281,19 @@ impl Engine {
             let old_cache = old_caches[j].take().expect("each old shape is matched once");
             let new = &self.shapes[k];
 
+            if old.water != new.water {
+                // Land became water or the reverse: everything it reaches changes.
+                tasks.push(Task::All(old_cache.rect));
+                if old.coast == new.coast && old.frame == new.frame {
+                    caches.push(old_cache);
+                } else {
+                    let cache = self.build_cache(k, None);
+                    tasks.push(Task::All(cache.rect));
+                    caches.push(cache);
+                }
+                continue;
+            }
+
             if old.coast.seed != new.coast.seed || old.frame != new.frame || old.coast.len() != new.coast.len() {
                 // Moved, rotated, scaled, reseeded, or points added/removed:
                 // rebuild this shape. Its old and new areas both change.
@@ -289,8 +324,8 @@ impl Engine {
 
             if moved.iter().any(|m| *m) {
                 let either: Vec<bool> = moved.iter().zip(&retuned).map(|(m, r)| *m || *r).collect();
-                let touched = self.reach_of(&old.coast, &either).union(self.reach_of(&new.coast, &either));
-                if self.shape_rect(&new.coast) != old_cache.rect {
+                let touched = self.reach_of(&old.coast, &old.frame, &either).union(self.reach_of(&new.coast, &new.frame, &either));
+                if self.shape_rect(new) != old_cache.rect {
                     // The shape's reach grew or shrank: rebuild its caches,
                     // keeping the noise where the areas overlap.
                     let cache = self.build_cache(k, Some(old_cache));
@@ -305,7 +340,7 @@ impl Engine {
             } else if retuned.iter().any(|r| *r) {
                 // Only sliders changed: geometry is still valid, and only
                 // cells whose nearest segment was retuned can change.
-                let rect = self.reach_of(&new.coast, &retuned);
+                let rect = self.reach_of(&new.coast, &new.frame, &retuned);
                 tasks.push(Task::Retuned { rect, shape: k, segments: retuned });
                 caches.push(old_cache);
             } else {
@@ -317,6 +352,19 @@ impl Engine {
             tasks.push(Task::All(cache.rect));
         }
         self.caches = caches;
+
+        // Order decides how shapes combine. If the relative order of shapes
+        // that exist before and after changed, redo every shape that moved.
+        let kept_old: Vec<u32> = old_shapes.iter().map(|s| s.id).filter(|id| self.shapes.iter().any(|n| n.id == *id)).collect();
+        let kept_new: Vec<u32> = self.shapes.iter().map(|s| s.id).filter(|id| kept_old.contains(id)).collect();
+        if kept_old != kept_new {
+            for (i, id) in kept_new.iter().enumerate() {
+                if kept_old[i] != *id {
+                    let k = self.shapes.iter().position(|s| s.id == *id).expect("kept shape exists");
+                    tasks.push(Task::All(self.caches[k].rect));
+                }
+            }
+        }
 
         let mut changed = Rect::EMPTY;
         for task in tasks {
@@ -337,7 +385,8 @@ impl Engine {
     }
 
     fn shade(&mut self, pixels: Rect) {
-        render::shade(&self.elevation, &mut self.rgba, self.width, self.height, self.cell_km * 1000.0, pixels);
+        let blend_km = self.smoothing * self.cell_km;
+        render::shade(&self.elevation, &self.shore, &mut self.rgba, self.width, self.height, self.cell_km, blend_km, pixels);
     }
 
     fn compute_base(&mut self) {
@@ -356,8 +405,8 @@ impl Engine {
     /// caches where the areas overlap (only valid if seed and frame are unchanged).
     fn build_cache(&self, k: usize, reuse: Option<ShapeCache>) -> ShapeCache {
         let shape = &self.shapes[k];
-        let rect = self.shape_rect(&shape.coast);
-        let mut cache = ShapeCache::new(rect);
+        let rect = self.shape_rect(shape);
+        let mut cache = ShapeCache::new(rect, shape.frame.clamp_km());
         if let Some(old) = &reuse {
             let overlap = old.rect.intersect(rect);
             for cy in overlap.y0..overlap.y1 {
@@ -379,41 +428,41 @@ impl Engine {
                 let idx = cache.index(cx, cy);
                 if cache.nearest[idx] != u32::MAX && cache.bands[idx].big.is_nan() {
                     let local = shape.frame.to_local(self.cell_center(cx, cy));
-                    cache.bands[idx] = coast_bands(local[0], local[1], shape.coast.seed, self.cell_km);
+                    // Detail scales with the shape, so pick octaves for the
+                    // cell size as seen in the shape's own coordinates.
+                    let local_cell = self.cell_km / shape.frame.detail_scale();
+                    cache.bands[idx] = coast_bands(local[0], local[1], shape.coast.seed, local_cell);
                 }
             }
         }
     }
 
-    /// Cells within CLAMP_KM of a shape: everything it can influence.
-    fn shape_rect(&self, coast: &Coastline) -> Rect {
+    /// Cells a shape can influence: within its clamp distance of its outline.
+    fn shape_rect(&self, shape: &Shape) -> Rect {
+        let c = shape.frame.clamp_km();
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for p in &coast.points {
+        for p in &shape.coast.points {
             x0 = x0.min(p[0]);
             y0 = y0.min(p[1]);
             x1 = x1.max(p[0]);
             y1 = y1.max(p[1]);
         }
-        self.km_box_to_cells(x0 - CLAMP_KM, y0 - CLAMP_KM, x1 + CLAMP_KM, y1 + CLAMP_KM)
+        self.km_box_to_cells(x0 - c, y0 - c, x1 + c, y1 + c)
     }
 
     /// Union of the reach of the flagged segments.
-    fn reach_of(&self, coast: &Coastline, flags: &[bool]) -> Rect {
+    fn reach_of(&self, coast: &Coastline, frame: &Frame, flags: &[bool]) -> Rect {
         flags
             .iter()
             .enumerate()
             .filter(|(_, f)| **f)
-            .fold(Rect::EMPTY, |r, (i, _)| r.union(self.segment_reach(coast, i)))
+            .fold(Rect::EMPTY, |r, (i, _)| r.union(self.segment_reach(coast, frame, i)))
     }
 
-    fn segment_reach(&self, coast: &Coastline, i: usize) -> Rect {
+    fn segment_reach(&self, coast: &Coastline, frame: &Frame, i: usize) -> Rect {
+        let c = frame.clamp_km();
         let (a, b) = coast.segment(i);
-        self.km_box_to_cells(
-            a[0].min(b[0]) - CLAMP_KM,
-            a[1].min(b[1]) - CLAMP_KM,
-            a[0].max(b[0]) + CLAMP_KM,
-            a[1].max(b[1]) + CLAMP_KM,
-        )
+        self.km_box_to_cells(a[0].min(b[0]) - c, a[1].min(b[1]) - c, a[0].max(b[0]) + c, a[1].max(b[1]) + c)
     }
 
     fn km_box_to_cells(&self, min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Rect {
@@ -448,17 +497,19 @@ impl Engine {
             return;
         }
         let coast = &self.shapes[k].coast;
+        let frame = &self.shapes[k].frame;
+        let clamp = frame.clamp_km();
         for cy in r.y0..r.y1 {
             for cx in r.x0..r.x1 {
                 let idx = cache.index(cx, cy);
-                cache.dist[idx] = CLAMP_KM;
+                cache.dist[idx] = clamp;
                 cache.nearest[idx] = u32::MAX;
             }
         }
 
         // Each segment visits only the cells it can reach.
         for i in 0..coast.len() {
-            let reach = self.segment_reach(coast, i).intersect(r);
+            let reach = self.segment_reach(coast, frame, i).intersect(r);
             let (a, b) = coast.segment(i);
             for cy in reach.y0..reach.y1 {
                 for cx in reach.x0..reach.x1 {
@@ -522,36 +573,45 @@ impl Engine {
                     }
                 }
                 let idx = (cy * self.width + cx) as usize;
-                // Union: the shape that puts this cell furthest inland wins.
-                let mut best = -CLAMP_KM;
-                let mut best_params = far;
+                // Start from open ocean, then apply each shape in order: land
+                // keeps whichever reaches furthest inland, water cuts into it.
+                let mut level = -CLAMP_KM;
+                let mut level_params = far;
                 let mut any = false;
                 for (shape, cache) in self.shapes.iter().zip(&self.caches) {
                     if !cache.rect.contains(cx, cy) {
                         continue;
                     }
+                    any = true;
                     let c = cache.index(cx, cy);
                     let d = cache.dist[c];
                     let signed = if cache.inside[c] { d } else { -d };
                     let seg = cache.nearest[c];
                     let (shifted, params) = if seg != u32::MAX {
                         let params = shape.coast.params_at(seg as usize, cache.along[c]);
-                        (signed + coastal_displacement(&cache.bands[c], &params), params)
+                        // The coast's detail scales with its shape.
+                        let push = coastal_displacement(&cache.bands[c], &params) * shape.frame.detail_scale();
+                        (signed + push, params)
                     } else {
                         // Too far from any segment for its parameters to matter.
                         (signed, far)
                     };
-                    if !any || shifted > best {
-                        best = shifted;
-                        best_params = params;
-                        any = true;
+                    if shape.water {
+                        if -shifted < level {
+                            level = -shifted;
+                            level_params = params;
+                        }
+                    } else if shifted > level {
+                        level = shifted;
+                        level_params = params;
                     }
                 }
                 self.elevation[idx] = if any {
-                    elevation_from_coast(self.base[idx], best, &best_params)
+                    elevation_from_coast(self.base[idx], level, &level_params)
                 } else {
                     EMPTY_ELEVATION
                 };
+                self.shore[idx] = level;
                 row_min = row_min.min(cx);
                 row_max = row_max.max(cx);
             }

@@ -30,14 +30,30 @@ benchmarks, and could run on a server for large exports later.
 ## Shapes
 
 The guides are a list of shapes, each a closed outline with per-segment
-parameters, a seed, and a **frame** (a position and rotation). The frame
-anchors the shape's coastline noise, so moving or rotating a shape carries
-its coves and headlands with it. Resizing leaves the frame in place, so the
-outline scales while fine detail is regenerated at real-world scale rather
-than stretched. The lowland height under the coast is anchored to the world.
+parameters, a seed, and a **frame** (position, rotation and scale). The frame
+anchors the shape's coastline noise, so moving, rotating or resizing a shape
+moves, turns or scales its coves and headlands with it: the coastline only
+changes when points move relative to each other. Detail scaling is limited
+to 1/8× to 8×, and each shape's area of influence grows with its scale so
+partial updates stay exact. The lowland height under the coast is anchored
+to the world.
 
-Shapes combine as a union: a cell is land if any shape makes it land, and
-where shapes overlap, the one reaching furthest inland decides the terrain.
+In the editor, each shape has slider values for all its segments, and each
+segment stores an adjustment on top. The effective value is the sum, kept
+within the slider's range, so shape and segment changes always add up.
+
+Each shape is land or water, and shapes combine in order, starting from
+open ocean: land shapes add land (where land shapes overlap, the one reaching
+furthest inland decides the terrain), water shapes cut water out of whatever
+came before them. The app sorts shapes by nesting, so a lake inside a
+continent cuts into it and an island inside that lake adds land back.
+
+By default the drawn line is the **inner edge** of every coast. Each segment
+has a Reach outside and a Reach inside; the coast stays between the two
+(roughness only ever adds outward). With Reach inside at zero, the default,
+everything inside a land shape is land and everything inside a water shape is
+water. Tests check this for land, water, and an island in a lake in a
+continent.
 Each shape keeps its own caches (distance to its coast, inside/outside, and
 its coastline noise) covering only the area it can reach. Noise is computed
 lazily, only near the coast, since cells far inland or out at sea never use it.
@@ -62,6 +78,25 @@ octaves (`octaves_for`), so zooming in reveals detail rather than blur.
 Edits go to both cores. The display draws the base map first and the detail
 layer over the area it covers. Frames from a window that has since been
 replaced are discarded by version number.
+
+## Edge smoothing
+
+The engine keeps each cell's signed distance to the final coastline. When
+edge smoothing is on, the renderer blends land and water colours across a
+band of the chosen width in pixels, so coastlines are anti-aliased with
+sub-pixel precision and no supersampling. Changing it only recolours, so it
+applies live, and it carries through to zoomed views and both export modes.
+
+## Full-detail export
+
+A full-detail export regenerates the whole map at the chosen size, not by
+enlarging the preview. Several background workers each generate horizontal
+strips of about a million pixels, using the same windowed engine as the
+zoomed view, so finer cells get more noise octaves and real detail. Each
+strip includes one extra row above and below so hillshading matches across
+strip edges. A streaming PNG encoder compresses rows as strips arrive, in
+order, so memory stays small even for a 16384-pixel image. The browser's own
+canvas size limits never apply.
 
 ## How partial updates stay exact
 
@@ -92,13 +127,14 @@ Browser times vary with hardware; the app shows live timings.
 | Edit | 1024 × 1024 | 2048 × 2048 |
 | --- | --- | --- |
 | Generate landmass | about 0.65 s | about 2.7 s |
-| Slider on one segment | about 11 ms | about 43 ms |
+| Slider on one segment | about 10 ms | about 43 ms |
 | Dragging one point | about 22 ms | about 86 ms |
-| Resizing a whole shape | about 24 ms | about 105 ms |
-| Moving or rotating a whole shape | about 95 ms | about 390 ms |
+| Moving, rotating or resizing a whole shape | about 95 to 115 ms | about 400 ms |
 
-Moving and rotating are slowest because they shift the shape's noise frame,
-so its coastline noise is recomputed. The outline on screen always follows
+Moving, rotating and resizing are slowest because they change the shape's
+noise frame, so its coastline noise is recomputed. The outline on screen always follows
 the mouse immediately; at 2048 the terrain trails slightly behind.
 
 A zoomed view takes about 1 to 1.5 s to sharpen after the view stops moving.
+A full-detail export at 4096 pixels took about 11 s in headless Firefox here;
+time grows with the square of the size.

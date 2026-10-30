@@ -3,20 +3,26 @@
 // deleting them, moving, resizing and rotating whole shapes, and drawing the
 // guide overlay. Pan and zoom gestures are passed to the app.
 
-import { DEFAULT_PARAMS, type Guides, type SegmentParams, type Vec2 } from "./protocol";
+import { DEFAULT_VALUES, NO_ADJUSTMENT, effective, toParams, type SliderValues } from "./params";
+import type { Guides, Vec2 } from "./protocol";
 
 export interface ShapeFrame {
   x: number;
   y: number;
   angle: number;
+  /** 1 when drawn; resizing multiplies it, so the coastline detail scales too. */
+  scale: number;
 }
 
 export interface ShapeModel {
   id: number;
   name: string;
-  kind: "land";
+  kind: "land" | "water";
   points: Vec2[];
-  params: SegmentParams[]; // params[i] belongs to the segment from points[i] to points[i + 1]
+  /** Coastline slider values for the whole shape. */
+  base: SliderValues;
+  /** Each segment's own adjustment on top of `base`. adjust[i] belongs to the segment from points[i] to points[i + 1]. */
+  adjust: SliderValues[];
   seed: number;
   /** Anchors the coastline detail, so it travels with the shape. */
   frame: ShapeFrame;
@@ -63,6 +69,7 @@ const ROTATE_OFFSET_PX = 26;
 const DRAG_THRESHOLD_PX = 4;
 
 const GUIDE = "#ffffff";
+const WATER_GUIDE = "#8fdcff";
 const HIGHLIGHT = "#f2b01e";
 const HALO = "rgba(10, 20, 28, 0.45)";
 
@@ -161,13 +168,43 @@ export class CoastEditor {
     return this.selection ? this.shape(this.selection.shape) : undefined;
   }
 
-  /** What the terrain engine needs: every visible shape. */
+  /** Edge smoothing (pixels), set by the app and passed through to the core. */
+  smoothingPx = 1;
+
+  /**
+   * What the terrain engine needs: every visible shape, outermost first.
+   * Shapes apply in order (land adds, water cuts out), so nesting decides the
+   * result: a lake inside a continent comes after it and cuts into it, and an
+   * island inside that lake comes after the lake and adds land back.
+   */
   guides(): Guides {
+    const visible = this.shapes.filter((s) => !s.hidden);
+    const area = (s: ShapeModel) => {
+      const b = boundingBox(s.points);
+      return (b.x1 - b.x0) * (b.y1 - b.y0);
+    };
+    const depth = new Map<number, number>();
+    for (const s of visible) {
+      const b = boundingBox(s.points);
+      const centre = { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2 };
+      const inside = insidePolygon(centre, s.points) ? centre : s.points[0];
+      depth.set(s.id, visible.filter((t) => t !== s && area(t) > area(s) && insidePolygon(inside, t.points)).length);
+    }
+    const ordered = visible
+      .map((s, i) => ({ s, i }))
+      .sort((a, b) => depth.get(a.s.id)! - depth.get(b.s.id)! || a.i - b.i)
+      .map(({ s }) => s);
     return {
       worldSeed: this.worldSeed,
-      shapes: this.shapes
-        .filter((s) => !s.hidden)
-        .map((s) => ({ id: s.id, seed: s.seed, frame: s.frame, points: s.points, params: s.params })),
+      smoothingPx: this.smoothingPx,
+      shapes: ordered.map((s) => ({
+        id: s.id,
+        seed: s.seed,
+        frame: s.frame,
+        water: s.kind === "water",
+        points: s.points,
+        params: s.adjust.map((a) => toParams(effective(s.base, a))),
+      })),
     };
   }
 
@@ -201,6 +238,18 @@ export class CoastEditor {
     if (!s) return;
     s.name = name.trim() || s.name;
     this.onEdit("list");
+  }
+
+  /** Make a shape land or water. Default names follow the kind. */
+  setKind(id: number, kind: "land" | "water"): void {
+    const s = this.shape(id);
+    if (!s || s.locked || s.kind === kind) return;
+    s.kind = kind;
+    const match = /^(Landmass|Lake) (\d+)$/.exec(s.name);
+    if (match) s.name = `${kind === "water" ? "Lake" : "Landmass"} ${match[2]}`;
+    this.onEdit("shape");
+    this.onEdit("selection");
+    this.draw();
   }
 
   toggleHidden(id: number): void {
@@ -241,19 +290,36 @@ export class CoastEditor {
     this.draw();
   }
 
-  setParams(index: number, params: SegmentParams): void {
+  /** The slider values a segment actually uses: its shape's plus its own adjustment. */
+  segmentValues(shape: ShapeModel, index: number): SliderValues {
+    return effective(shape.base, shape.adjust[index]);
+  }
+
+  /** Change the whole shape's values. Every segment keeps its own adjustment on top. */
+  setShapeValues(values: SliderValues): void {
     const s = this.selectedShape();
     if (!s || s.locked) return;
-    s.params[index] = { ...params };
+    s.base = { ...values };
     this.onEdit("shape");
   }
 
-  /** Apply settings to every segment of the selected shape. */
-  applyToAll(params: SegmentParams): void {
+  /** Set a segment's values; stored as its adjustment from the shape's values. */
+  setSegmentValues(index: number, values: SliderValues): void {
     const s = this.selectedShape();
     if (!s || s.locked) return;
-    s.params = s.points.map(() => ({ ...params }));
+    const adjust = {} as SliderValues;
+    for (const k of Object.keys(values) as (keyof SliderValues)[]) adjust[k] = values[k] - s.base[k];
+    s.adjust[index] = adjust;
     this.onEdit("shape");
+  }
+
+  /** Remove a segment's own adjustment, so it follows its shape exactly. */
+  resetSegment(index: number): void {
+    const s = this.selectedShape();
+    if (!s || s.locked) return;
+    s.adjust[index] = { ...NO_ADJUSTMENT };
+    this.onEdit("shape");
+    this.onEdit("selection");
   }
 
   deletePoint(index: number): void {
@@ -261,7 +327,7 @@ export class CoastEditor {
     if (!s || s.locked || s.points.length <= 3) return;
     s.points.splice(index, 1);
     // Removing a point merges the segments either side; keep the earlier one.
-    s.params.splice(index, 1);
+    s.adjust.splice(index, 1);
     this.selection = { kind: "shape", shape: s.id };
     this.onEdit("shape");
     this.onEdit("selection");
@@ -482,9 +548,10 @@ export class CoastEditor {
       name: `Landmass ${this.nextNumber++}`,
       kind: "land",
       points,
-      params: points.map(() => ({ ...DEFAULT_PARAMS })),
+      base: { ...DEFAULT_VALUES },
+      adjust: points.map(() => ({ ...NO_ADJUSTMENT })),
       seed: newSeed(),
-      frame: { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2, angle: 0 },
+      frame: { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2, angle: 0, scale: 1 },
       hidden: false,
       locked: false,
     };
@@ -567,10 +634,11 @@ export class CoastEditor {
       const turn = (q: Vec2) => ({ x: c.x + (q.x - c.x) * cos - (q.y - c.y) * sin, y: c.y + (q.x - c.x) * sin + (q.y - c.y) * cos });
       shape.points = drag.points.map((q) => this.clampToMap(turn(q)));
       // The frame turns too, so the coastline detail turns with the shape.
-      shape.frame = { ...turn(drag.frame), angle: drag.frame.angle + angle };
+      shape.frame = { ...drag.frame, ...turn(drag.frame), angle: drag.frame.angle + angle };
     } else {
-      // Resize from the opposite corner. The frame stays put, so the outline
-      // scales but fine detail is regenerated at real-world scale.
+      // Resize from the opposite corner. Proportional by default, so the
+      // coastline is an exact enlargement or reduction; Shift stretches freely.
+      // The frame scales with the shape, so the coastline detail does too.
       const corners = boxCorners(b);
       const corner = drag.mode.corner;
       const anchor = corners[(corner + 2) % 4];
@@ -578,8 +646,10 @@ export class CoastEditor {
       const minKm = 10;
       let sx = Math.max(minKm / (b.x1 - b.x0 || 1), (p.x - anchor.x) / (from.x - anchor.x || 1));
       let sy = Math.max(minKm / (b.y1 - b.y0 || 1), (p.y - anchor.y) / (from.y - anchor.y || 1));
-      if (this.shiftHeld) sx = sy = Math.max(sx, sy);
-      shape.points = drag.points.map((q) => this.clampToMap({ x: anchor.x + (q.x - anchor.x) * sx, y: anchor.y + (q.y - anchor.y) * sy }));
+      if (!this.shiftHeld) sx = sy = Math.max(sx, sy);
+      const scale = (q: { x: number; y: number }) => ({ x: anchor.x + (q.x - anchor.x) * sx, y: anchor.y + (q.y - anchor.y) * sy });
+      shape.points = drag.points.map((q) => this.clampToMap(scale(q)));
+      shape.frame = { ...drag.frame, ...scale(drag.frame), scale: drag.frame.scale * Math.sqrt(sx * sy) };
     }
     this.onEdit("shape");
   }
@@ -610,10 +680,10 @@ export class CoastEditor {
     if (selected && this.hitPoint(p, selected.points) !== null) return;
     const seg = this.hitSegment(p);
     if (!seg) return;
-    const { points, params } = seg.shape;
+    const { points, adjust } = seg.shape;
     points.splice(seg.index + 1, 0, seg.at);
-    // The split halves both keep the original segment's settings.
-    params.splice(seg.index + 1, 0, { ...params[seg.index] });
+    // The split halves both keep the original segment's adjustment.
+    adjust.splice(seg.index + 1, 0, { ...adjust[seg.index] });
     this.selection = { kind: "point", shape: seg.shape.id, index: seg.index + 1 };
     this.onEdit("shape");
     this.onEdit("selection");
@@ -783,11 +853,14 @@ export class CoastEditor {
     ctx.lineWidth = focused ? 4 : 3;
     ctx.stroke();
     this.path(pts, true);
-    ctx.strokeStyle = shape.locked ? "rgba(255, 255, 255, 0.55)" : focused || hovered ? GUIDE : "rgba(255, 255, 255, 0.75)";
+    const ink = shape.kind === "water" ? WATER_GUIDE : GUIDE;
+    ctx.strokeStyle = ink;
+    ctx.globalAlpha = shape.locked ? 0.55 : focused || hovered ? 1 : 0.75;
     ctx.lineWidth = focused ? 1.75 : 1.25;
     ctx.setLineDash(shape.locked ? [4, 4] : []);
     ctx.stroke();
     ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
 
     const segment = (index: number, color: string, width: number) => {
       const a = pts[index];
@@ -810,7 +883,7 @@ export class CoastEditor {
       pts.forEach((p, i) => {
         const selected = sel?.kind === "point" && sel.index === i;
         const hover = this.hover?.kind === "point" && this.hover.shape === shape.id && this.hover.index === i;
-        this.square(p, hover || selected ? 5 : 3.5, selected ? HIGHLIGHT : GUIDE);
+        this.square(p, hover || selected ? 5 : 3.5, selected ? HIGHLIGHT : ink);
       });
     }
   }

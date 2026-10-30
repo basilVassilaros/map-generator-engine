@@ -4,9 +4,10 @@ Drives the mouse the way a person would: draws two shapes, generates terrain,
 moves, resizes and rotates a shape, uses sliders, inserts points, locks,
 renames, hides, zooms, exports a PNG and deletes a shape.
 
-Needs Firefox, geckodriver and Selenium (`pip install selenium`). Build the
-app first (`npm run build`), then from web/:  python3 tests/ui-test.py
-Set FIREFOX and GECKODRIVER if they aren't on your PATH.
+Needs Firefox and Selenium 4.6 or later (`pip install selenium`). Selenium
+downloads the matching geckodriver by itself. Build the app first
+(`npm run build`), then from web/:  python3 tests/ui-test.py
+Set FIREFOX or GECKODRIVER only if Selenium can't find them.
 """
 import time, os, glob, shutil, tempfile
 from pathlib import Path
@@ -21,7 +22,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
 opts = Options()
-opts.binary_location = os.environ.get("FIREFOX") or shutil.which("firefox") or "firefox"
+if os.environ.get("FIREFOX"):
+    opts.binary_location = os.environ["FIREFOX"]
 DOWNLOADS = tempfile.mkdtemp()
 SHOTS = Path(__file__).parent / "screenshots"
 SHOTS.mkdir(exist_ok=True)
@@ -30,8 +32,9 @@ opts.add_argument("-headless")
 opts.set_preference("browser.download.folderList", 2)
 opts.set_preference("browser.download.dir", DOWNLOADS)
 opts.set_preference("browser.helperApps.neverAsk.saveToDisk", "image/png")
+opts.set_preference("dom.dialog_element.enabled", True)
 opts.set_preference("browser.download.useDownloadDir", True)
-d = webdriver.Firefox(options=opts, service=Service(os.environ.get("GECKODRIVER") or shutil.which("geckodriver") or "geckodriver"))
+d = webdriver.Firefox(options=opts, service=Service(os.environ.get("GECKODRIVER") or shutil.which("geckodriver")))
 d.set_window_size(1440, 960)
 d.get(PAGE)
 d.execute_script("window.__errors=[];window.addEventListener('error',e=>__errors.push(String(e.message)));window.addEventListener('unhandledrejection',e=>__errors.push(String(e.reason)));")
@@ -137,7 +140,7 @@ shot("05-rotated")
 mid = ((A[0][0]+A[1][0])/2, (A[0][1]+A[1][1])/2)
 click_km(*mid)
 check("clicking a segment shows its sliders", not hidden("segment-panel"), text("segment-title"))
-slider = d.find_element(By.ID, "coves")
+slider = d.find_element(By.ID, "segment-coves")
 d.execute_script("arguments[0].value=100;arguments[0].dispatchEvent(new Event('input'))", slider); wait_frames(1.5)
 check("slider edit updates terrain", "Last update took" in text("timing"), text("timing") + " / " + text("timing-detail"))
 shot("06-segment-slider")
@@ -149,15 +152,74 @@ mouse().move_to_element_with_offset(overlay, ox, oy).double_click().perform(); t
 after_pts = d.find_elements(By.CSS_SELECTOR, ".shape-row .shape-kind")[0].text
 check("double-click inserts a point", before_pts != after_pts, f"{before_pts} -> {after_pts}")
 
+# Coast reach slider updates terrain (select a segment first: the insertion
+# above left a point selected).
+click_km((A[1][0]+A[2][0])/2, (A[1][1]+A[2][1])/2)
+before = d.execute_script("return document.getElementById('map').toDataURL().length")
+reach = d.find_element(By.ID, "segment-reach")
+d.execute_script("arguments[0].value=60;arguments[0].dispatchEvent(new Event('input'))", reach); wait_frames(1.5)
+after = d.execute_script("return document.getElementById('map').toDataURL().length")
+check("Reach outside slider changes the coastline", before != after, text("segment-reach-value"))
+before = after
+inside = d.find_element(By.ID, "segment-inside")
+d.execute_script("arguments[0].value=50;arguments[0].dispatchEvent(new Event('input'))", inside); wait_frames(1.5)
+after = d.execute_script("return document.getElementById('map').toDataURL().length")
+check("Reach inside slider changes the coastline", before != after, text("segment-inside-value"))
+
+# Shape values add to segment adjustments: shape +x, segment +y, shape +x again.
+def set_slider(el_id, v):
+    d.execute_script("const e=document.getElementById(arguments[0]);e.value=arguments[1];e.dispatchEvent(new Event('input'))", el_id, v)
+    time.sleep(0.3)
+def value(el_id): return int(float(d.execute_script("return document.getElementById(arguments[0]).value", el_id)))
+seg_mid = ((A[2][0]+A[3][0])/2, (A[2][1]+A[3][1])/2)
+click_km(*seg_mid)                                   # a segment of shape A
+seg_before = value("segment-roughness")
+click_km(330, 500)                                   # select shape A (inside, away from lines)
+shape_before = value("shape-roughness")
+set_slider("shape-roughness", shape_before - 10)     # shape: -10
+click_km(*seg_mid); set_slider("segment-roughness", value("segment-roughness") + 25)   # segment: +25
+click_km(330, 500); set_slider("shape-roughness", shape_before - 10 + 5)              # shape: +5
+click_km(*seg_mid)
+seg_after = value("segment-roughness")
+check("segment value = segment change + shape changes", seg_after == seg_before - 10 + 25 + 5, f"{seg_before} -> {seg_after}, expected {seg_before - 10 + 25 + 5}")
+check("adjusted segment shows its difference", "from shape" in text("segment-roughness-value"), text("segment-roughness-value"))
+d.find_element(By.ID, "reset-segment").click(); time.sleep(0.3)
+check("reset returns the segment to the shape value", value("segment-roughness") == shape_before - 5, f"{value('segment-roughness')} vs {shape_before - 5}")
+wait_frames(1)
+before = after
+sm = d.find_element(By.ID, "smoothing")
+d.execute_script("arguments[0].value=0;arguments[0].dispatchEvent(new Event('input'))", sm); wait_frames(1.5)
+after = d.execute_script("return document.getElementById('map').toDataURL().length")
+check("Edge smoothing slider recolours the map", before != after and text("smoothing-value") == "Off", text("smoothing-value"))
+d.execute_script("arguments[0].value=1;arguments[0].dispatchEvent(new Event('input'))", sm); wait_frames(1.5)
+
+# Draw a lake inside shape A and switch it to water.
+d.find_element(By.ID, "new-shape").click(); time.sleep(0.2)
+LAKE = [(420,430),(560,420),(590,540),(450,580)]
+for p in LAKE: click_km(*p)
+click_km(*LAKE[0]); wait_frames()
+d.find_element(By.ID, "kind-water").click(); wait_frames()
+rows_text = text("shape-list")
+check("a shape can be switched to water", "Lake 3" in rows_text and "Water" in rows_text, rows_text.replace("\n", " | "))
+px = d.execute_script("""
+  const c=document.getElementById('map'), r=c.getBoundingClientRect();
+  // Sample the displayed map at the lake's centre (km 505, 495).
+  const s=(Math.min(r.width,r.height)-48), left=r.width/2-s/2, top=r.height/2-s/2;
+  const x=left+505/1600*s, y=top+495/1600*s, dpr=window.devicePixelRatio||1;
+  const p=c.getContext('2d').getImageData(Math.round(x*dpr),Math.round(y*dpr),1,1).data;
+  return [p[0],p[1],p[2]];""")
+check("the inside of the lake is water", px[2] > px[0] + 30, f"pixel {px}")
+shot("06b-lake")
+
 # Lock shape A, then clicking its fill must not select it.
 lock_btn = d.find_elements(By.CSS_SELECTOR, ".shape-row")[0].find_elements(By.CSS_SELECTOR, ".icon-btn")[1]
 lock_btn.click(); time.sleep(0.2)
 click_km(900, 900)  # empty sea, deselect
-click_km(480, 500)  # inside shape A
+click_km(300, 640)  # inside shape A, outside the lake
 check("locked shape can't be selected on the map", hidden("shape-panel") and hidden("segment-panel"))
 lock_btn = d.find_elements(By.CSS_SELECTOR, ".shape-row")[0].find_elements(By.CSS_SELECTOR, ".icon-btn")[1]
 lock_btn.click(); time.sleep(0.2)
-click_km(480, 500)
+click_km(300, 640)
 check("unlocked shape selects by clicking its fill", not hidden("shape-panel"))
 
 # Rename.
@@ -181,17 +243,46 @@ check("zoomed detail finishes sharpening", d.execute_script("return document.get
 shot("08-zoomed")
 d.find_element(By.ID, "zoom-fit").click(); time.sleep(0.5)
 
-# Export PNG.
-d.find_element(By.ID, "export").click(); time.sleep(3)
+# Export PNG: quick, then full detail.
+def export(mode, size=None):
+    d.find_element(By.ID, "export").click(); time.sleep(0.3)
+    check(f"export dialog opens ({mode})", d.execute_script("return document.getElementById('export-dialog').open"))
+    d.find_element(By.CSS_SELECTOR, f'input[name="export-mode"][value="{mode}"]').click(); time.sleep(0.2)
+    if size:
+        from selenium.webdriver.support.ui import Select
+        Select(d.find_element(By.ID, "full-size")).select_by_value(str(size))
+    d.find_element(By.ID, "export-go").click()
+export("quick"); time.sleep(3)
 files = glob.glob(os.path.join(DOWNLOADS, "*.png"))
-check("Export PNG downloads a file", len(files) == 1, ", ".join(os.path.basename(f) + f" {os.path.getsize(f)//1024} KB" for f in files))
+check("quick export downloads the working-resolution image", any("1024px" in f for f in files), ", ".join(os.path.basename(f) for f in files))
+t0 = time.time()
+export("full", 4096)
+for _ in range(240):
+    time.sleep(0.5)
+    if glob.glob(os.path.join(DOWNLOADS, "*4096px.png")) and not glob.glob(os.path.join(DOWNLOADS, "*.part")): break
+big = glob.glob(os.path.join(DOWNLOADS, "*4096px.png"))
+info = ""
+if big:
+    time.sleep(1)
+    try:
+        from PIL import Image
+        with Image.open(big[0]) as im:
+            im.load(); info = f"{im.size[0]}x{im.size[1]} {im.mode}, {os.path.getsize(big[0])//1024//1024} MB, {time.time()-t0:.0f} s"
+            ok = im.size == (4096, 4096)
+            im.reduce(4).save(str(SHOTS / "full-export-preview.png"))
+    except Exception as e:
+        ok = False; info = f"couldn't open: {e}"
+else:
+    ok = False
+check("full-detail export writes a valid 4096 PNG", ok, info or text("export-status"))
+check("export status reports the size", "MB" in text("export-status"), text("export-status"))
 
 # Delete shape B with the two-step confirmation.
 d.find_elements(By.CSS_SELECTOR, ".shape-row .shape-pick")[1].click(); time.sleep(0.2)
 btn = d.find_element(By.ID, "delete-shape"); btn.click(); time.sleep(0.2)
-check("delete asks for confirmation", "again" in btn.text and len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) == 2, btn.text)
+check("delete asks for confirmation", "again" in btn.text and len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) == 3, btn.text)
 btn.click(); wait_frames()
-check("second click deletes the shape", len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) == 1)
+check("second click deletes the shape", len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) == 2)
 shot("09-deleted")
 
 errs = d.execute_script("return window.__errors")

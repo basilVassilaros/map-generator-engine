@@ -9,8 +9,9 @@
 
 import { CoastEditor, type EditKind, type ShapeModel } from "./editor";
 import { EngineClient, type Frame } from "./engine-client";
-import { exportPng } from "./export";
-import { MAX_SHORE_KM, MIN_SHORE_KM, type SegmentParams } from "./protocol";
+import { exportPng, saveBlob } from "./export";
+import { exportFullDetail } from "./export-full";
+import { SLIDERS, isAdjusted, type SliderKey, type SliderValues } from "./params";
 
 const EXTENT_KM = 1600;
 const REAL_TIME_MS = 100;
@@ -38,6 +39,18 @@ const shapeFacts = $<HTMLParagraphElement>("shape-facts");
 const shapeHelp = $<HTMLParagraphElement>("shape-help");
 const deleteShapeBtn = $<HTMLButtonElement>("delete-shape");
 const segmentShape = $<HTMLParagraphElement>("segment-shape");
+const kindLand = $<HTMLButtonElement>("kind-land");
+const kindWater = $<HTMLButtonElement>("kind-water");
+const exportDialog = $<HTMLDialogElement>("export-dialog");
+const quickHint = $<HTMLSpanElement>("quick-hint");
+const fullOptions = $<HTMLDivElement>("full-options");
+const fullSize = $<HTMLSelectElement>("full-size");
+const fullEstimate = $<HTMLParagraphElement>("full-estimate");
+const exportProgress = $<HTMLDivElement>("export-progress");
+const exportBar = $<HTMLProgressElement>("export-bar");
+const exportProgressText = $<HTMLParagraphElement>("export-progress-text");
+const exportCancel = $<HTMLButtonElement>("export-cancel");
+const exportGo = $<HTMLButtonElement>("export-go");
 const exportBtn = $<HTMLButtonElement>("export");
 const exportStatus = $<HTMLParagraphElement>("export-status");
 const guidance = $<HTMLParagraphElement>("guidance");
@@ -46,7 +59,7 @@ const segmentTitle = $<HTMLElement>("segment-title");
 const pointPanel = $<HTMLElement>("point-panel");
 const pointTitle = $<HTMLElement>("point-title");
 const deletePointBtn = $<HTMLButtonElement>("delete-point");
-const applyAllBtn = $<HTMLButtonElement>("apply-all");
+const resetSegmentBtn = $<HTMLButtonElement>("reset-segment");
 const resolutionSelect = $<HTMLSelectElement>("resolution");
 const timing = $<HTMLParagraphElement>("timing");
 const timingDetail = $<HTMLParagraphElement>("timing-detail");
@@ -57,21 +70,61 @@ const zoomFit = $<HTMLButtonElement>("zoom-fit");
 const zoomLevel = $<HTMLOutputElement>("zoom-level");
 const detailBadge = $<HTMLSpanElement>("detail-badge");
 
-const sliders = {
-  roughness: $<HTMLInputElement>("roughness"),
-  coves: $<HTMLInputElement>("coves"),
-  shore: $<HTMLInputElement>("shore"),
-};
-const readouts = {
-  roughness: $<HTMLOutputElement>("roughness-value"),
-  coves: $<HTMLOutputElement>("coves-value"),
-  shore: $<HTMLOutputElement>("shore-value"),
-};
+const smoothingSlider = $<HTMLInputElement>("smoothing");
+const smoothingValue = $<HTMLOutputElement>("smoothing-value");
+/**
+ * A set of the coastline sliders in `container`. `onChange` receives all
+ * values whenever one moves. Built once and updated in place, so dragging a
+ * slider never loses focus when the panel refreshes.
+ */
+function sliderSet(container: HTMLElement, prefix: string, onChange: (values: SliderValues) => void) {
+  const inputs = {} as Record<SliderKey, HTMLInputElement>;
+  const outputs = {} as Record<SliderKey, HTMLOutputElement>;
+  for (const spec of SLIDERS) {
+    const id = `${prefix}-${spec.key}`;
+    const field = document.createElement("div");
+    field.className = "field";
+    field.innerHTML = `<div class="field-head"><label for="${id}"></label><output id="${id}-value"></output></div>
+      <input id="${id}" type="range" min="${spec.min}" max="${spec.max}" step="${spec.step}">
+      <p class="hint"></p>`;
+    field.querySelector("label")!.textContent = spec.label;
+    field.querySelector(".hint")!.textContent = spec.hint;
+    inputs[spec.key] = field.querySelector("input")!;
+    outputs[spec.key] = field.querySelector("output")!;
+    container.append(field);
+  }
+  const read = () => {
+    const v = {} as SliderValues;
+    for (const spec of SLIDERS) v[spec.key] = Number(inputs[spec.key].value);
+    return v;
+  };
+  for (const spec of SLIDERS) {
+    inputs[spec.key].addEventListener("input", () => onChange(read()));
+  }
+  return {
+    /** Show values; `adjust`, if given, marks how far each differs from the shape. */
+    show(values: SliderValues, adjust?: SliderValues, disabled = false) {
+      for (const spec of SLIDERS) {
+        if (document.activeElement !== inputs[spec.key]) inputs[spec.key].value = String(values[spec.key]);
+        inputs[spec.key].disabled = disabled;
+        outputs[spec.key].textContent = spec.format(values[spec.key]);
+        const a = adjust?.[spec.key] ?? 0;
+        if (a !== 0) {
+          const mark = document.createElement("span");
+          mark.className = "adjusted";
+          mark.textContent = spec.key === "shore" ? "adjusted" : `${a > 0 ? "+" : "−"}${Math.abs(Math.round(a))} from shape`;
+          outputs[spec.key].append(mark);
+        }
+      }
+    },
+  };
+}
 
-// Shore distance spans 0.1 to 30 km, so the slider is logarithmic: equal
-// slider travel gives an equal ratio, which keeps cliffs and beaches both usable.
-const shoreFromSlider = (v: number) => MIN_SHORE_KM * Math.pow(MAX_SHORE_KM / MIN_SHORE_KM, v / 1000);
-const sliderFromShore = (km: number) => Math.round((Math.log(km / MIN_SHORE_KM) / Math.log(MAX_SHORE_KM / MIN_SHORE_KM)) * 1000);
+const shapeSliders = sliderSet($("shape-sliders"), "shape", (values) => editor.setShapeValues(values));
+const segmentSliders = sliderSet($("segment-sliders"), "segment", (values) => {
+  const sel = editor.selection;
+  if (sel?.kind === "segment") editor.setSegmentValues(sel.index, values);
+});
 
 let resolution = Number(resolutionSelect.value);
 let generated = false;
@@ -352,7 +405,7 @@ function renderShapeList(): void {
       const pick = document.createElement("button");
       pick.className = "shape-pick";
       pick.setAttribute("aria-pressed", String(selected));
-      pick.innerHTML = `<span class="shape-name"></span><span class="shape-kind">Land · ${shape.points.length} points</span>`;
+      pick.innerHTML = `<span class="shape-name"></span><span class="shape-kind">${shape.kind === "water" ? "Water" : "Land"} · ${shape.points.length} points</span>`;
       pick.querySelector(".shape-name")!.textContent = shape.name;
       pick.addEventListener("click", () => editor.select({ kind: "shape", shape: shape.id }));
 
@@ -397,10 +450,14 @@ function refreshPanel(): void {
   if (shape && sel?.kind === "shape") {
     if (document.activeElement !== shapeName) shapeName.value = shape.name;
     shapeName.disabled = false;
-    shapeFacts.textContent = `Land · ${shape.points.length} points${shape.hidden ? " · hidden" : ""}${shape.locked ? " · locked" : ""}`;
+    shapeFacts.textContent = `${shape.points.length} points${shape.hidden ? " · hidden" : ""}${shape.locked ? " · locked" : ""}`;
+    kindLand.setAttribute("aria-pressed", String(shape.kind === "land"));
+    kindWater.setAttribute("aria-pressed", String(shape.kind === "water"));
+    kindLand.disabled = kindWater.disabled = shape.locked;
+    shapeSliders.show(shape.base, undefined, shape.locked);
     shapeHelp.textContent = shape.locked
       ? "This shape is locked, so it can't be selected or changed on the map. Unlock it in the list above to edit it."
-      : "Drag inside the box to move, drag a corner to resize (Shift keeps proportions), drag the round handle to rotate (Shift snaps to 15°).";
+      : "Drag inside the box to move, a corner to resize (the coastline scales with it; Shift stretches freely), or the round handle to rotate (Shift snaps to 15°).";
     deleteShapeBtn.disabled = shape.locked;
   }
 
@@ -408,12 +465,10 @@ function refreshPanel(): void {
   segmentPanel.hidden = seg === null;
   if (seg !== null && shape) {
     segmentTitle.textContent = `Segment ${seg + 1} of ${shape.points.length}`;
-    segmentShape.textContent = `${shape.name}. Double-click the line on the map to add a point there.`;
-    const p = shape.params[seg];
-    sliders.roughness.value = String(Math.round(p.roughness * 100));
-    sliders.coves.value = String(Math.round(p.coves * 100));
-    sliders.shore.value = String(sliderFromShore(p.shoreKm));
-    showReadouts(p);
+    segmentShape.textContent = `Part of ${shape.name}. Values here add to the shape's own. Double-click the line on the map to add a point there.`;
+    const adjust = shape.adjust[seg];
+    segmentSliders.show(editor.segmentValues(shape, seg), adjust, shape.locked);
+    resetSegmentBtn.disabled = shape.locked || !isAdjusted(adjust);
   }
 
   const point = sel?.kind === "point" && shape ? sel.index : null;
@@ -424,35 +479,21 @@ function refreshPanel(): void {
   }
 }
 
-function showReadouts(p: SegmentParams): void {
-  readouts.roughness.textContent = `${Math.round(p.roughness * 100)}%`;
-  readouts.coves.textContent = `${Math.round(p.coves * 100)}%`;
-  readouts.shore.textContent = p.shoreKm < 1 ? `${Math.round(p.shoreKm * 1000)} m` : `${p.shoreKm.toFixed(1)} km`;
-}
-
-function paramsFromSliders(): SegmentParams {
-  return {
-    roughness: Number(sliders.roughness.value) / 100,
-    coves: Number(sliders.coves.value) / 100,
-    shoreKm: shoreFromSlider(Number(sliders.shore.value)),
-  };
-}
-
-for (const slider of Object.values(sliders)) {
-  slider.addEventListener("input", () => {
-    const sel = editor.selection;
-    if (sel?.kind !== "segment") return;
-    const p = paramsFromSliders();
-    showReadouts(p);
-    editor.setParams(sel.index, p);
-  });
-}
-
-applyAllBtn.addEventListener("click", () => editor.applyToAll(paramsFromSliders()));
+resetSegmentBtn.addEventListener("click", () => {
+  if (editor.selection?.kind === "segment") editor.resetSegment(editor.selection.index);
+});
 deletePointBtn.addEventListener("click", () => {
   if (editor.selection?.kind === "point") editor.deletePoint(editor.selection.index);
 });
 newShapeBtn.addEventListener("click", () => editor.newShape());
+kindLand.addEventListener("click", () => {
+  const shape = editor.selectedShape();
+  if (shape) editor.setKind(shape.id, "land");
+});
+kindWater.addEventListener("click", () => {
+  const shape = editor.selectedShape();
+  if (shape) editor.setKind(shape.id, "water");
+});
 shapeName.addEventListener("change", () => {
   const shape = editor.selectedShape();
   if (shape) editor.rename(shape.id, shapeName.value);
@@ -484,12 +525,92 @@ confirmable(clearBtn, "Clear all shapes", "Click again to clear", () => {
   refreshPanel();
 });
 
-exportBtn.addEventListener("click", async () => {
-  exportBtn.disabled = true;
-  exportStatus.textContent = "Preparing image…";
-  exportStatus.textContent = await exportPng(baseCanvas, `world-map-${resolution}px.png`);
-  exportBtn.disabled = !generated;
+// --- export ------------------------------------------------------------------------
+
+let exporting: AbortController | null = null;
+
+const exportMode = () => (document.querySelector<HTMLInputElement>('input[name="export-mode"]:checked')?.value ?? "quick") as "quick" | "full";
+
+function describeExport(): void {
+  const kmPerPx = (EXTENT_KM / resolution).toFixed(1);
+  quickHint.textContent = `The map as shown: ${resolution} × ${resolution} pixels (${kmPerPx} km per pixel). Instant.`;
+  fullOptions.hidden = exportMode() !== "full";
+  const size = Number(fullSize.value);
+  const workers = Math.max(1, Math.min(6, (navigator.hardwareConcurrency || 2) - 1));
+  // Roughly 0.8 million pixels per second per worker on a typical laptop.
+  const seconds = (size * size) / (800_000 * workers);
+  const time = seconds < 60 ? `about ${Math.max(5, Math.round(seconds / 5) * 5)} seconds` : `about ${Math.round(seconds / 60)} minute${seconds >= 90 ? "s" : ""}`;
+  fullEstimate.textContent = `Takes ${time} here, using ${workers} background thread${workers > 1 ? "s" : ""}. You can keep working while it runs.`;
+}
+
+function setExporting(active: boolean): void {
+  exportDialog.querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select").forEach((el) => (el.disabled = active));
+  exportGo.disabled = active;
+  exportProgress.hidden = !active;
+  exportCancel.textContent = active ? "Cancel export" : "Cancel";
+}
+
+exportBtn.addEventListener("click", () => {
+  describeExport();
+  setExporting(false);
+  exportDialog.showModal();
 });
+exportDialog.addEventListener("change", describeExport);
+exportCancel.addEventListener("click", () => {
+  if (exporting) exporting.abort();
+  else exportDialog.close();
+});
+exportDialog.addEventListener("cancel", (e) => {
+  // Escape closes the dialog only when nothing is running.
+  if (exporting) e.preventDefault();
+});
+
+exportGo.addEventListener("click", async () => {
+  if (exportMode() === "quick") {
+    exportDialog.close();
+    exportStatus.textContent = "Preparing image…";
+    exportStatus.textContent = await exportPng(baseCanvas, `world-map-${resolution}px.png`);
+    return;
+  }
+  const size = Number(fullSize.value);
+  exporting = new AbortController();
+  setExporting(true);
+  exportBar.value = 0;
+  exportProgressText.textContent = "Starting…";
+  try {
+    const blob = await exportFullDetail(size, EXTENT_KM, editor.guides(), (p) => {
+      exportBar.value = p.done / p.total;
+      const left = p.remainingMs === null ? "" : p.remainingMs < 60_000 ? `, about ${Math.ceil(p.remainingMs / 1000)} s left` : `, about ${Math.ceil(p.remainingMs / 60_000)} min left`;
+      exportProgressText.textContent = `${Math.round((p.done / p.total) * 100)}% generated${left}`;
+    }, exporting.signal);
+    exportProgressText.textContent = "Saving…";
+    const mb = (blob.size / 1024 / 1024).toFixed(blob.size > 100 * 1024 * 1024 ? 0 : 1);
+    exportDialog.close();
+    const status = await saveBlob(blob, `world-map-${size}px.png`);
+    exportStatus.textContent = `${status.replace(/\.$/, "")} (${mb} MB).`;
+  } catch (err) {
+    const cancelled = err instanceof DOMException && err.name === "AbortError";
+    exportStatus.textContent = cancelled ? "Export cancelled." : `Export failed: ${err instanceof Error ? err.message : String(err)}`;
+    exportDialog.close();
+  } finally {
+    exporting = null;
+    setExporting(false);
+  }
+});
+
+function showSmoothing(): void {
+  const px = Number(smoothingSlider.value);
+  smoothingValue.textContent = px === 0 ? "Off" : `${px} px`;
+}
+smoothingSlider.addEventListener("input", () => {
+  editor.smoothingPx = Number(smoothingSlider.value);
+  showSmoothing();
+  // Only recolours, so it's cheap enough to apply live, even before generating.
+  const guides = editor.guides();
+  base.setGuides(generated ? guides : { ...guides, shapes: [] });
+  if (detailActive()) detail.setGuides(guides);
+});
+showSmoothing();
 
 resolutionSelect.addEventListener("change", () => {
   resolution = Number(resolutionSelect.value);

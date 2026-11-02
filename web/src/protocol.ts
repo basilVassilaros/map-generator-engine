@@ -21,8 +21,9 @@ export interface GuideShape {
   seed: number;
   /** Anchors the coastline detail: position (km), rotation (radians) and scale. */
   frame: { x: number; y: number; angle: number; scale: number };
-  /** Water shapes (lakes, seas) cut water out of land. */
-  water: boolean;
+  /** Land adds land, water cuts out lakes and seas, highland raises (or lowers) land by `height` metres. */
+  kind: "land" | "water" | "highland";
+  height: number;
   points: Vec2[];
   params: SegmentParams[]; // params[i] belongs to the segment from points[i] to points[i + 1]
 }
@@ -74,15 +75,16 @@ export type FromCore =
 /** Flat encoding the core reads; see core/src/ffi.rs. */
 export function encodeGuides(guides: Guides): Float32Array {
   const shapes = guides.shapes.filter((s) => s.points.length >= 3);
-  const size = 3 + shapes.reduce((n, s) => n + 8 + s.points.length * 7, 0);
+  const size = 3 + shapes.reduce((n, s) => n + 9 + s.points.length * 7, 0);
   const out = new Float32Array(size);
   out[0] = guides.worldSeed;
   out[1] = guides.smoothingPx;
   out[2] = shapes.length;
   let at = 3;
   for (const s of shapes) {
-    out.set([s.id, s.seed, s.frame.x, s.frame.y, s.frame.angle, s.frame.scale, s.water ? 1 : 0, s.points.length], at);
-    at += 8;
+    const kind = s.kind === "water" ? 1 : s.kind === "highland" ? 2 : 0;
+    out.set([s.id, s.seed, s.frame.x, s.frame.y, s.frame.angle, s.frame.scale, kind, s.height, s.points.length], at);
+    at += 9;
     for (const p of s.points) {
       out[at++] = p.x;
       out[at++] = p.y;

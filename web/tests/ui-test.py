@@ -193,6 +193,30 @@ after = d.execute_script("return document.getElementById('map').toDataURL().leng
 check("Edge smoothing slider recolours the map", before != after and text("smoothing-value") == "Off", text("smoothing-value"))
 d.execute_script("arguments[0].value=1;arguments[0].dispatchEvent(new Event('input'))", sm); wait_frames(1.5)
 
+# Ctrl+Click selects several segments; a slider moves them all by the same amount.
+def ctrl_click_km(x, y):
+    ox, oy = km_to_offset(x, y)
+    mouse().move_to_element_with_offset(overlay, ox, oy).key_down(Keys.CONTROL).click().key_up(Keys.CONTROL).perform()
+    time.sleep(0.2)
+segs = [((A[2][0]+A[3][0])/2, (A[2][1]+A[3][1])/2), ((A[3][0]+A[4][0])/2, (A[3][1]+A[4][1])/2), ((A[4][0]+A[0][0])/2, (A[4][1]+A[0][1])/2)]
+click_km(*segs[1])                     # give the middle segment its own value first
+set_slider("segment-roughness", value("segment-roughness") + 20)
+d.execute_script("document.getElementById('segment-roughness').dispatchEvent(new Event('change', {bubbles: true}))")
+click_km(*segs[0])
+r0 = value("segment-roughness")
+ctrl_click_km(*segs[1]); r1 = value("segment-roughness")
+ctrl_click_km(*segs[2]); r2 = value("segment-roughness")
+check("Ctrl+Click selects several segments", text("segment-title") == "3 segments selected", text("segment-title"))
+set_slider("segment-roughness", r2 + 10); d.execute_script("document.getElementById('segment-roughness').dispatchEvent(new Event('change', {bubbles: true}))")
+wait_frames(1)
+after = []
+for p in segs:
+    click_km(*p); after.append(value("segment-roughness"))
+check("a slider moves every selected segment by the same amount, keeping differences", r1 != r0 and after == [r0 + 10, r1 + 10, r2 + 10], f"{[r0, r1, r2]} -> {after}")
+click_km(*segs[0]); ctrl_click_km(*segs[1]); ctrl_click_km(*segs[1])
+check("Ctrl+Click again removes a segment", text("segment-title").startswith("Segment "), text("segment-title"))
+shot("06a-multi-select")
+
 # Draw a lake inside shape A and switch it to water.
 d.find_element(By.ID, "new-shape").click(); time.sleep(0.2)
 LAKE = [(420,430),(560,420),(590,540),(450,580)]
@@ -211,11 +235,33 @@ px = d.execute_script("""
 check("the inside of the lake is water", px[2] > px[0] + 30, f"pixel {px}")
 shot("06b-lake")
 
+# A highland inside shape A raises the ground: the map turns from lowland
+# green towards upland brown there.
+def map_pixel(x_km, y_km):
+    return d.execute_script("""
+      const c=document.getElementById('map'), r=c.getBoundingClientRect();
+      const s=(Math.min(r.width,r.height)-48), left=r.width/2-s/2, top=r.height/2-s/2;
+      const x=left+arguments[0]/1600*s, y=top+arguments[1]/1600*s, dpr=window.devicePixelRatio||1;
+      const p=c.getContext('2d').getImageData(Math.round(x*dpr),Math.round(y*dpr),1,1).data;
+      return [p[0],p[1],p[2]];""", x_km, y_km)
+low = map_pixel(330, 375)
+d.find_element(By.ID, "new-shape").click(); time.sleep(0.2)
+HIGH = [(270,330),(400,320),(390,420),(280,430)]
+for p in HIGH: click_km(*p)
+click_km(*HIGH[0]); wait_frames()
+d.find_element(By.ID, "kind-highland").click(); wait_frames()
+check("a shape can become a highland", "Highland" in text("shape-list") and not hidden("height-field"), text("height-value"))
+set_slider("height", 2000); wait_frames()
+high = map_pixel(330, 375)
+check("raising a highland changes the ground inside it", high != low and high[0] - high[1] > low[0] - low[1], f"{low} -> {high}")
+check("highland edge slope is labelled for escarpments", "Edge slope" in d.find_element(By.ID, "shape-sliders").text)
+shot("06c-highland")
+
 # Lock shape A, then clicking its fill must not select it.
 lock_btn = d.find_elements(By.CSS_SELECTOR, ".shape-row")[0].find_elements(By.CSS_SELECTOR, ".icon-btn")[1]
 lock_btn.click(); time.sleep(0.2)
 click_km(900, 900)  # empty sea, deselect
-click_km(300, 640)  # inside shape A, outside the lake
+click_km(300, 640)  # inside shape A, outside the lake and highland
 check("locked shape can't be selected on the map", hidden("shape-panel") and hidden("segment-panel"))
 lock_btn = d.find_elements(By.CSS_SELECTOR, ".shape-row")[0].find_elements(By.CSS_SELECTOR, ".icon-btn")[1]
 lock_btn.click(); time.sleep(0.2)
@@ -277,12 +323,52 @@ else:
 check("full-detail export writes a valid 4096 PNG", ok, info or text("export-status"))
 check("export status reports the size", "MB" in text("export-status"), text("export-status"))
 
+# Reference image: import, adjust, lock; clicks then pass through it.
+from PIL import Image as PILImage, ImageDraw
+ref_path = os.path.join(DOWNLOADS, "sketch.png")
+im = PILImage.new("RGB", (600, 400), "white"); dr = ImageDraw.Draw(im)
+dr.polygon([(80, 60), (420, 40), (520, 300), (120, 340)], outline="black", width=6); im.save(ref_path)
+d.execute_script("document.getElementById('import-file').hidden=false")
+d.find_element(By.ID, "import-file").send_keys(ref_path); time.sleep(1)
+d.execute_script("document.getElementById('import-file').hidden=true")
+check("importing an image adds a reference layer", "Reference image" in text("shape-list") and not hidden("reference-panel"), text("reference-name"))
+set_slider("reference-opacity", 80)
+check("reference opacity can be changed", text("reference-opacity-value") == "80%", text("reference-opacity-value"))
+before = d.execute_script("return document.getElementById('overlay').toDataURL().length")
+drag_km(800, 800, 900, 850); time.sleep(0.3)
+after = d.execute_script("return document.getElementById('overlay').toDataURL().length")
+check("a selected reference image can be dragged", before != after)
+rows = d.find_elements(By.CSS_SELECTOR, ".shape-row")
+rows[-1].find_elements(By.CSS_SELECTOR, ".icon-btn")[1].click(); time.sleep(0.3)
+check("reference image can be locked", "Locked" in text("reference-help"), text("reference-help"))
+click_km(300, 640)
+check("clicks pass through a locked reference to the shapes", not hidden("shape-panel"))
+shot("09a-reference")
+
+# Grid squares.
+from selenium.webdriver.support.ui import Select
+Select(d.find_element(By.ID, "grid")).select_by_value("100"); time.sleep(0.3)
+
+# Map width: halve it, scaling shapes with the map, then restore.
+def set_width(km, choice):
+    w = d.find_element(By.ID, "map-width"); w.clear(); w.send_keys(str(km)); time.sleep(0.2)
+    d.find_element(By.ID, "map-width-apply").click(); time.sleep(0.3)
+    d.find_element(By.ID, choice).click(); wait_frames(3.5)
+set_width(800, "width-scale")
+check("map width changes", "800 km across" in text("map-facts"), text("map-facts"))
+check("resolution labels follow the map width", "781 m per pixel" in d.find_element(By.ID, "resolution").text, d.find_element(By.ID, "resolution").text.split("\n")[1])
+check("shapes survive a map width change", len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) >= 4)
+shot("09b-map-800km")
+set_width(1600, "width-scale")
+check("map width restores", "1,600 km across" in text("map-facts"), text("map-facts"))
+
 # Delete shape B with the two-step confirmation.
 d.find_elements(By.CSS_SELECTOR, ".shape-row .shape-pick")[1].click(); time.sleep(0.2)
 btn = d.find_element(By.ID, "delete-shape"); btn.click(); time.sleep(0.2)
-check("delete asks for confirmation", "again" in btn.text and len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) == 3, btn.text)
+n_before = len(d.find_elements(By.CSS_SELECTOR, ".shape-row"))
+check("delete asks for confirmation", "again" in btn.text, btn.text)
 btn.click(); wait_frames()
-check("second click deletes the shape", len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) == 2)
+check("second click deletes the shape", len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) == n_before - 1)
 shot("09-deleted")
 
 errs = d.execute_script("return window.__errors")

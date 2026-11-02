@@ -7,13 +7,16 @@
 //     whenever the view is zoomed in. Until it's ready, the base map is shown
 //     enlarged, so zooming always responds instantly.
 
-import { CoastEditor, type EditKind, type ShapeModel } from "./editor";
+import { CoastEditor, selectedSegments, type EditKind, type ShapeKindName, type ShapeModel } from "./editor";
 import { EngineClient, type Frame } from "./engine-client";
 import { exportPng, saveBlob } from "./export";
 import { exportFullDetail } from "./export-full";
 import { SLIDERS, isAdjusted, type SliderKey, type SliderValues } from "./params";
 
-const EXTENT_KM = 1600;
+/** The real width of the map; set in the Map panel. */
+const mapKm = () => editor.mapWidthKm;
+const MIN_MAP_KM = 50;
+const MAX_MAP_KM = 40_000;
 const REAL_TIME_MS = 100;
 const MAX_ZOOM = 32;
 /** Below this zoom the base map already shows all the detail there is. */
@@ -41,6 +44,28 @@ const deleteShapeBtn = $<HTMLButtonElement>("delete-shape");
 const segmentShape = $<HTMLParagraphElement>("segment-shape");
 const kindLand = $<HTMLButtonElement>("kind-land");
 const kindWater = $<HTMLButtonElement>("kind-water");
+const kindHighland = $<HTMLButtonElement>("kind-highland");
+const kindHint = $<HTMLParagraphElement>("kind-hint");
+const heightField = $<HTMLDivElement>("height-field");
+const heightSlider = $<HTMLInputElement>("height");
+const heightValue = $<HTMLOutputElement>("height-value");
+const importBtn = $<HTMLButtonElement>("import-image");
+const importFile = $<HTMLInputElement>("import-file");
+const referencePanel = $<HTMLElement>("reference-panel");
+const referenceName = $<HTMLParagraphElement>("reference-name");
+const referenceOpacity = $<HTMLInputElement>("reference-opacity");
+const referenceOpacityValue = $<HTMLOutputElement>("reference-opacity-value");
+const referenceHelp = $<HTMLParagraphElement>("reference-help");
+const referenceReplace = $<HTMLButtonElement>("reference-replace");
+const referenceRemove = $<HTMLButtonElement>("reference-remove");
+const mapWidthInput = $<HTMLInputElement>("map-width");
+const mapWidthApply = $<HTMLButtonElement>("map-width-apply");
+const mapWidthChoice = $<HTMLDivElement>("map-width-choice");
+const widthKeep = $<HTMLButtonElement>("width-keep");
+const widthScale = $<HTMLButtonElement>("width-scale");
+const gridSelect = $<HTMLSelectElement>("grid");
+const showGrid = $<HTMLInputElement>("show-grid");
+const mapFacts = $<HTMLParagraphElement>("map-facts");
 const exportDialog = $<HTMLDialogElement>("export-dialog");
 const quickHint = $<HTMLSpanElement>("quick-hint");
 const fullOptions = $<HTMLDivElement>("full-options");
@@ -80,6 +105,8 @@ const smoothingValue = $<HTMLOutputElement>("smoothing-value");
 function sliderSet(container: HTMLElement, prefix: string, onChange: (values: SliderValues) => void) {
   const inputs = {} as Record<SliderKey, HTMLInputElement>;
   const outputs = {} as Record<SliderKey, HTMLOutputElement>;
+  const labels = {} as Record<SliderKey, HTMLLabelElement>;
+  const hints = {} as Record<SliderKey, HTMLParagraphElement>;
   for (const spec of SLIDERS) {
     const id = `${prefix}-${spec.key}`;
     const field = document.createElement("div");
@@ -91,6 +118,8 @@ function sliderSet(container: HTMLElement, prefix: string, onChange: (values: Sl
     field.querySelector(".hint")!.textContent = spec.hint;
     inputs[spec.key] = field.querySelector("input")!;
     outputs[spec.key] = field.querySelector("output")!;
+    labels[spec.key] = field.querySelector("label")!;
+    hints[spec.key] = field.querySelector(".hint")!;
     container.append(field);
   }
   const read = () => {
@@ -102,6 +131,14 @@ function sliderSet(container: HTMLElement, prefix: string, onChange: (values: Sl
     inputs[spec.key].addEventListener("input", () => onChange(read()));
   }
   return {
+    /** A highland's edge is an escarpment, so its slope slider says so. */
+    labelFor(kind: ShapeKindName) {
+      const highland = kind === "highland";
+      labels.shore.textContent = highland ? "Edge slope" : "Shore slope";
+      hints.shore.textContent = highland
+        ? "How far the escarpment takes to rise. Short makes a cliff, long a gentle ramp."
+        : SLIDERS.find((x) => x.key === "shore")!.hint;
+    },
     /** Show values; `adjust`, if given, marks how far each differs from the shape. */
     show(values: SliderValues, adjust?: SliderValues, disabled = false) {
       for (const spec of SLIDERS) {
@@ -121,22 +158,39 @@ function sliderSet(container: HTMLElement, prefix: string, onChange: (values: Sl
 }
 
 const shapeSliders = sliderSet($("shape-sliders"), "shape", (values) => editor.setShapeValues(values));
+// With several segments selected, a slider moves them all by the same amount,
+// keeping their differences. Their values are captured when a drag starts, so
+// one that hits the end of the range springs back if the slider returns.
+let dragStart: Map<number, SliderValues> | null = null;
 const segmentSliders = sliderSet($("segment-sliders"), "segment", (values) => {
   const sel = editor.selection;
-  if (sel?.kind === "segment") editor.setSegmentValues(sel.index, values);
+  const shape = editor.selectedShape();
+  if (sel?.kind !== "segment" || !shape) return;
+  const indices = selectedSegments(sel);
+  if (!dragStart) dragStart = new Map(indices.map((i) => [i, editor.segmentValues(shape, i)]));
+  const from = dragStart.get(sel.index) ?? editor.segmentValues(shape, sel.index);
+  editor.setManySegmentValues(
+    indices.map((i) => {
+      const start = dragStart!.get(i) ?? editor.segmentValues(shape, i);
+      const next = {} as SliderValues;
+      for (const spec of SLIDERS) next[spec.key] = Math.min(spec.max, Math.max(spec.min, start[spec.key] + values[spec.key] - from[spec.key]));
+      return [i, next] as [number, SliderValues];
+    }),
+  );
 });
+$("segment-sliders").addEventListener("change", () => (dragStart = null));
 
 let resolution = Number(resolutionSelect.value);
 let generated = false;
 
-const editor = new CoastEditor(overlay, EXTENT_KM);
+const editor = new CoastEditor(overlay, 1600);
 const base = new EngineClient();
 const detail = new EngineClient();
 
 // --- view --------------------------------------------------------------------
 
 /** Zoom level and the world position (km) at the centre of the stage. */
-const view = { zoom: 1, cx: EXTENT_KM / 2, cy: EXTENT_KM / 2 };
+const view = { zoom: 1, cx: 800, cy: 800 };
 
 function fitSize(): number {
   return Math.max(200, Math.min(stage.clientWidth, stage.clientHeight) - 48);
@@ -146,8 +200,8 @@ function fitSize(): number {
 function mapRect() {
   const size = fitSize() * view.zoom;
   return {
-    left: stage.clientWidth / 2 - (view.cx / EXTENT_KM) * size,
-    top: stage.clientHeight / 2 - (view.cy / EXTENT_KM) * size,
+    left: stage.clientWidth / 2 - (view.cx / mapKm()) * size,
+    top: stage.clientHeight / 2 - (view.cy / mapKm()) * size,
     size,
   };
 }
@@ -155,11 +209,11 @@ function mapRect() {
 function setView(zoom: number, cx: number, cy: number): void {
   view.zoom = Math.min(MAX_ZOOM, Math.max(1, zoom));
   if (view.zoom === 1) {
-    view.cx = EXTENT_KM / 2;
-    view.cy = EXTENT_KM / 2;
+    view.cx = mapKm() / 2;
+    view.cy = mapKm() / 2;
   } else {
-    view.cx = Math.min(EXTENT_KM, Math.max(0, cx));
-    view.cy = Math.min(EXTENT_KM, Math.max(0, cy));
+    view.cx = Math.min(mapKm(), Math.max(0, cx));
+    view.cy = Math.min(mapKm(), Math.max(0, cy));
   }
   const r = mapRect();
   editor.setView(r.left, r.top, r.size);
@@ -174,18 +228,18 @@ function setView(zoom: number, cx: number, cy: number): void {
 /** Zoom by `factor`, keeping the world point under stage pixel (x, y) still. */
 function zoomAt(factor: number, x: number, y: number): void {
   const r = mapRect();
-  const kmX = ((x - r.left) / r.size) * EXTENT_KM;
-  const kmY = ((y - r.top) / r.size) * EXTENT_KM;
+  const kmX = ((x - r.left) / r.size) * mapKm();
+  const kmY = ((y - r.top) / r.size) * mapKm();
   const zoom = Math.min(MAX_ZOOM, Math.max(1, view.zoom * factor));
   const size = fitSize() * zoom;
-  setView(zoom, kmX - ((x - stage.clientWidth / 2) / size) * EXTENT_KM, kmY - ((y - stage.clientHeight / 2) / size) * EXTENT_KM);
+  setView(zoom, kmX - ((x - stage.clientWidth / 2) / size) * mapKm(), kmY - ((y - stage.clientHeight / 2) / size) * mapKm());
 }
 
 editor.onZoom = zoomAt;
 editor.onPan = (dx, dy) => {
   if (view.zoom <= 1) return;
   const size = fitSize() * view.zoom;
-  setView(view.zoom, view.cx - (dx / size) * EXTENT_KM, view.cy - (dy / size) * EXTENT_KM);
+  setView(view.zoom, view.cx - (dx / size) * mapKm(), view.cy - (dy / size) * mapKm());
 };
 zoomIn.addEventListener("click", () => zoomAt(2, stage.clientWidth / 2, stage.clientHeight / 2));
 zoomOut.addEventListener("click", () => zoomAt(0.5, stage.clientWidth / 2, stage.clientHeight / 2));
@@ -235,7 +289,7 @@ function render(): void {
   ctx.imageSmoothingQuality = "high";
   if (baseCanvas.width) ctx.drawImage(baseCanvas, r.left, r.top, r.size, r.size);
   if (detailShown) {
-    const s = r.size / EXTENT_KM;
+    const s = r.size / mapKm();
     ctx.drawImage(detailShown.canvas, r.left + detailShown.x * s, r.top + detailShown.y * s, detailShown.w * s, detailShown.h * s);
   }
   // Outline the map edge when zoomed so its limits stay clear.
@@ -270,7 +324,7 @@ function startDetail(): void {
   const bottom = Math.min(stage.clientHeight, r.top + r.size);
   if (right - left < 8 || bottom - top < 8) return;
 
-  const kmPerPx = EXTENT_KM / r.size;
+  const kmPerPx = mapKm() / r.size;
   const area = { x: (left - r.left) * kmPerPx, y: (top - r.top) * kmPerPx, w: (right - left) * kmPerPx, h: (bottom - top) * kmPerPx };
   const dpr = window.devicePixelRatio || 1;
   const scale = Math.min(dpr, Math.sqrt(MAX_DETAIL_PIXELS / ((right - left) * (bottom - top))));
@@ -297,7 +351,7 @@ function paint(canvas: HTMLCanvasElement, frame: Frame): void {
 function startBase(): void {
   baseCanvas.width = resolution;
   baseCanvas.height = resolution;
-  baseInit = base.init(resolution, resolution, EXTENT_KM);
+  baseInit = base.init(resolution, resolution, mapKm());
   if (generated) base.setGuides(editor.guides());
 }
 
@@ -364,7 +418,9 @@ function guidanceText(): string {
   }
   if (!generated) return "Generate the landmass to see the terrain, or add another shape first.";
   const sel = editor.selection;
+  if (editor.referenceSelected) return "";
   if (sel?.kind === "segment") return "";
+  if (sel === null && generated && editor.shapes.length && !editor.drawing) return "Click a shape to select it, or a stretch of its coast to adjust it. Ctrl+Click (Cmd+Click on a Mac) to pick several stretches.";
   if (sel?.kind === "point") return "Drag the point to reshape the coast. Delete or Backspace removes it.";
   // A selected shape's instructions live in its own panel.
   if (sel?.kind === "shape") return "";
@@ -405,7 +461,8 @@ function renderShapeList(): void {
       const pick = document.createElement("button");
       pick.className = "shape-pick";
       pick.setAttribute("aria-pressed", String(selected));
-      pick.innerHTML = `<span class="shape-name"></span><span class="shape-kind">${shape.kind === "water" ? "Water" : "Land"} · ${shape.points.length} points</span>`;
+      const kindLabel = shape.kind === "water" ? "Water" : shape.kind === "highland" ? `Highland · ${shape.height > 0 ? "+" : ""}${shape.height} m` : "Land";
+      pick.innerHTML = `<span class="shape-name"></span><span class="shape-kind">${kindLabel} · ${shape.points.length} points</span>`;
       pick.querySelector(".shape-name")!.textContent = shape.name;
       pick.addEventListener("click", () => editor.select({ kind: "shape", shape: shape.id }));
 
@@ -427,6 +484,33 @@ function renderShapeList(): void {
       return li;
     }),
   );
+  const ref = editor.reference;
+  if (ref) {
+    const li = document.createElement("li");
+    li.className = "shape-row reference";
+    li.classList.toggle("selected", editor.referenceSelected);
+    li.classList.toggle("hidden-shape", ref.hidden);
+    const pick = document.createElement("button");
+    pick.className = "shape-pick";
+    pick.setAttribute("aria-pressed", String(editor.referenceSelected));
+    pick.innerHTML = `<span class="shape-name">Reference image</span><span class="shape-kind">For tracing · ${Math.round(ref.opacity * 100)}% opacity</span>`;
+    pick.addEventListener("click", () => editor.selectReference());
+    const hide = document.createElement("button");
+    hide.className = "icon-btn";
+    hide.innerHTML = ref.hidden ? ICON_EYE_OFF : ICON_EYE;
+    hide.setAttribute("aria-label", ref.hidden ? "Show reference image" : "Hide reference image");
+    hide.title = ref.hidden ? "Show" : "Hide";
+    hide.addEventListener("click", () => editor.updateReference({ hidden: !ref.hidden }));
+    const lock = document.createElement("button");
+    lock.className = "icon-btn";
+    lock.innerHTML = ref.locked ? ICON_LOCK : ICON_UNLOCK;
+    lock.setAttribute("aria-label", ref.locked ? "Unlock reference image" : "Lock reference image");
+    lock.title = ref.locked ? "Unlock" : "Lock";
+    lock.addEventListener("click", () => editor.updateReference({ locked: !ref.locked }));
+    li.append(pick, hide, lock);
+    shapeList.append(li);
+  }
+  importBtn.hidden = !!ref;
   if (editor.draft && editor.shapes.length) {
     const li = document.createElement("li");
     li.className = "shape-row drafting";
@@ -453,7 +537,18 @@ function refreshPanel(): void {
     shapeFacts.textContent = `${shape.points.length} points${shape.hidden ? " · hidden" : ""}${shape.locked ? " · locked" : ""}`;
     kindLand.setAttribute("aria-pressed", String(shape.kind === "land"));
     kindWater.setAttribute("aria-pressed", String(shape.kind === "water"));
-    kindLand.disabled = kindWater.disabled = shape.locked;
+    kindHighland.setAttribute("aria-pressed", String(shape.kind === "highland"));
+    kindLand.disabled = kindWater.disabled = kindHighland.disabled = shape.locked;
+    kindHint.textContent = {
+      land: "Adds land. Overlapping land shapes join into one landmass.",
+      water: "Becomes a lake, sea or bay. A lake on high ground stays at that height. Land drawn inside water becomes an island.",
+      highland: "Raises the land inside it, with an escarpment at the edge. Draw it over land; it never raises the sea.",
+    }[shape.kind];
+    heightField.hidden = shape.kind !== "highland";
+    if (document.activeElement !== heightSlider) heightSlider.value = String(shape.height);
+    heightSlider.disabled = shape.locked;
+    heightValue.textContent = `${shape.height > 0 ? "+" : ""}${shape.height.toLocaleString()} m`;
+    shapeSliders.labelFor(shape.kind);
     shapeSliders.show(shape.base, undefined, shape.locked);
     shapeHelp.textContent = shape.locked
       ? "This shape is locked, so it can't be selected or changed on the map. Unlock it in the list above to edit it."
@@ -461,14 +556,33 @@ function refreshPanel(): void {
     deleteShapeBtn.disabled = shape.locked;
   }
 
+  const ref = editor.reference;
+  referencePanel.hidden = !ref || !editor.referenceSelected;
+  if (ref && editor.referenceSelected) {
+    referenceName.textContent = ref.name;
+    if (document.activeElement !== referenceOpacity) referenceOpacity.value = String(Math.round(ref.opacity * 100));
+    referenceOpacityValue.textContent = `${Math.round(ref.opacity * 100)}%`;
+    referenceHelp.textContent = ref.locked
+      ? "Locked: it stays put, and clicks pass through it to the map. Unlock it in the list above to move it."
+      : ref.hidden
+        ? "Hidden. Show it again from the list above."
+        : "Drag inside its box to move it, a corner to resize (Shift stretches), or the round handle to rotate. Lock it when it's in place.";
+  }
+
   const seg = generated && sel?.kind === "segment" && shape ? sel.index : null;
   segmentPanel.hidden = seg === null;
   if (seg !== null && shape) {
-    segmentTitle.textContent = `Segment ${seg + 1} of ${shape.points.length}`;
-    segmentShape.textContent = `Part of ${shape.name}. Values here add to the shape's own. Double-click the line on the map to add a point there.`;
+    const count = selectedSegments(sel).length;
+    segmentTitle.textContent = count > 1 ? `${count} segments selected` : `Segment ${seg + 1} of ${shape.points.length}`;
+    segmentShape.textContent =
+      count > 1
+        ? `Part of ${shape.name}. Sliders show the last one you picked and move all ${count} by the same amount. Ctrl+Click (Cmd+Click on a Mac) a segment to add or remove it.`
+        : `Part of ${shape.name}. Values here add to the shape's own. Ctrl+Click (Cmd+Click on a Mac) more segments to adjust them together; double-click the line to add a point.`;
     const adjust = shape.adjust[seg];
+    segmentSliders.labelFor(shape.kind);
     segmentSliders.show(editor.segmentValues(shape, seg), adjust, shape.locked);
-    resetSegmentBtn.disabled = shape.locked || !isAdjusted(adjust);
+    resetSegmentBtn.disabled = shape.locked || !selectedSegments(sel).some((i) => isAdjusted(shape.adjust[i]));
+    resetSegmentBtn.textContent = count > 1 ? "Reset these to shape values" : "Reset to shape values";
   }
 
   const point = sel?.kind === "point" && shape ? sel.index : null;
@@ -480,7 +594,7 @@ function refreshPanel(): void {
 }
 
 resetSegmentBtn.addEventListener("click", () => {
-  if (editor.selection?.kind === "segment") editor.resetSegment(editor.selection.index);
+  if (editor.selection?.kind === "segment") editor.resetSegments(selectedSegments(editor.selection));
 });
 deletePointBtn.addEventListener("click", () => {
   if (editor.selection?.kind === "point") editor.deletePoint(editor.selection.index);
@@ -489,6 +603,14 @@ newShapeBtn.addEventListener("click", () => editor.newShape());
 kindLand.addEventListener("click", () => {
   const shape = editor.selectedShape();
   if (shape) editor.setKind(shape.id, "land");
+});
+kindHighland.addEventListener("click", () => {
+  const shape = editor.selectedShape();
+  if (shape) editor.setKind(shape.id, "highland");
+});
+heightSlider.addEventListener("input", () => {
+  const shape = editor.selectedShape();
+  if (shape) editor.setHeight(shape.id, Number(heightSlider.value));
 });
 kindWater.addEventListener("click", () => {
   const shape = editor.selectedShape();
@@ -532,7 +654,7 @@ let exporting: AbortController | null = null;
 const exportMode = () => (document.querySelector<HTMLInputElement>('input[name="export-mode"]:checked')?.value ?? "quick") as "quick" | "full";
 
 function describeExport(): void {
-  const kmPerPx = (EXTENT_KM / resolution).toFixed(1);
+  const kmPerPx = (mapKm() / resolution).toFixed(1);
   quickHint.textContent = `The map as shown: ${resolution} × ${resolution} pixels (${kmPerPx} km per pixel). Instant.`;
   fullOptions.hidden = exportMode() !== "full";
   const size = Number(fullSize.value);
@@ -578,7 +700,7 @@ exportGo.addEventListener("click", async () => {
   exportBar.value = 0;
   exportProgressText.textContent = "Starting…";
   try {
-    const blob = await exportFullDetail(size, EXTENT_KM, editor.guides(), (p) => {
+    const blob = await exportFullDetail(size, mapKm(), editor.guides(), (p) => {
       exportBar.value = p.done / p.total;
       const left = p.remainingMs === null ? "" : p.remainingMs < 60_000 ? `, about ${Math.ceil(p.remainingMs / 1000)} s left` : `, about ${Math.ceil(p.remainingMs / 60_000)} min left`;
       exportProgressText.textContent = `${Math.round((p.done / p.total) * 100)}% generated${left}`;
@@ -612,12 +734,105 @@ smoothingSlider.addEventListener("input", () => {
 });
 showSmoothing();
 
+// --- reference image ---------------------------------------------------------------
+
+function chooseImage(): void {
+  importFile.value = "";
+  importFile.click();
+}
+importBtn.addEventListener("click", chooseImage);
+referenceReplace.addEventListener("click", chooseImage);
+importFile.addEventListener("change", () => {
+  const file = importFile.files?.[0];
+  if (!file) return;
+  const image = new Image();
+  const url = URL.createObjectURL(file);
+  image.onload = () => {
+    // The picture stays on this computer: it's only ever drawn on screen.
+    const old = editor.reference;
+    editor.setReference(image, file.name);
+    if (old) editor.updateReference({ opacity: old.opacity });
+  };
+  image.onerror = () => {
+    URL.revokeObjectURL(url);
+    exportStatus.textContent = `“${file.name}” couldn't be opened as an image.`;
+  };
+  image.src = url;
+});
+referenceOpacity.addEventListener("input", () => editor.updateReference({ opacity: Number(referenceOpacity.value) / 100 }));
+confirmable(referenceRemove, "Remove", "Click again to remove", () => editor.removeReference());
+
+// --- map size and grid -----------------------------------------------------------------
+
+function describeMap(): void {
+  const km = mapKm();
+  for (const option of Array.from(resolutionSelect.options)) {
+    const px = Number(option.value);
+    option.textContent = `${px} × ${px} (${formatKm(km / px)} per pixel)`;
+  }
+  for (const option of Array.from(fullSize.options)) {
+    const px = Number(option.value);
+    option.textContent = `${px} × ${px} (${formatKm(km / px)} per pixel)`;
+  }
+  mapFacts.textContent = `The map is ${km.toLocaleString()} km across.`;
+}
+
+function formatKm(km: number): string {
+  return km >= 1 ? `${km.toFixed(km >= 10 ? 0 : 1)} km` : `${Math.round(km * 1000)} m`;
+}
+
+function requestedWidth(): number | null {
+  const km = Math.round(Number(mapWidthInput.value));
+  return Number.isFinite(km) && km >= MIN_MAP_KM && km <= MAX_MAP_KM ? km : null;
+}
+
+mapWidthInput.addEventListener("input", () => {
+  const km = requestedWidth();
+  mapWidthApply.hidden = km === null || km === mapKm();
+  mapWidthChoice.hidden = true;
+});
+mapWidthInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !mapWidthApply.hidden) mapWidthApply.click();
+});
+mapWidthApply.addEventListener("click", () => {
+  if (requestedWidth() === null) return;
+  if (editor.shapes.length || editor.draft?.length || editor.reference) {
+    mapWidthChoice.hidden = false;
+  } else {
+    applyMapWidth(false);
+  }
+});
+widthKeep.addEventListener("click", () => applyMapWidth(false));
+widthScale.addEventListener("click", () => applyMapWidth(true));
+
+function applyMapWidth(scaleContent: boolean): void {
+  const km = requestedWidth();
+  if (km === null) return;
+  editor.setMapWidth(km, scaleContent);
+  mapWidthInput.value = String(km);
+  mapWidthApply.hidden = true;
+  mapWidthChoice.hidden = true;
+  startBase();
+  setView(1, 0, 0);
+  describeMap();
+}
+
+gridSelect.addEventListener("change", () => {
+  editor.gridKm = Number(gridSelect.value);
+  editor.draw();
+});
+showGrid.addEventListener("change", () => {
+  editor.showGrid = showGrid.checked;
+  editor.draw();
+});
+
 resolutionSelect.addEventListener("change", () => {
   resolution = Number(resolutionSelect.value);
   startBase();
 });
 
 editor.onEdit = (kind: EditKind) => {
+  if (kind === "selection") dragStart = null;
   if (kind === "shape" && generated) {
     const guides = editor.guides();
     base.setGuides(guides);
@@ -637,4 +852,5 @@ if (typeof WebAssembly === "undefined") {
   startBase();
 }
 setView(1, 0, 0);
+describeMap();
 refreshPanel();

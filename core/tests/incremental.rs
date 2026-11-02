@@ -113,7 +113,7 @@ fn window_lines_up_with_the_whole_map() {
 
 // --- multiple shapes ----------------------------------------------------------
 
-use terrain_core::{Frame, Shape};
+use terrain_core::{Frame, Shape, ShapeKind};
 
 fn island(id: u32, cx: f32, cy: f32, r: f32, seed: u32) -> Shape {
     let points: Vec<[f32; 2]> = (0..7)
@@ -123,7 +123,7 @@ fn island(id: u32, cx: f32, cy: f32, r: f32, seed: u32) -> Shape {
         })
         .collect();
     let params = points.iter().map(|_| SegmentParams::default()).collect();
-    Shape { id, coast: Coastline { points, params, seed }, frame: Frame { x: cx, y: cy, angle: 0.0, scale: 1.0 }, water: false }
+    Shape { id, coast: Coastline { points, params, seed }, frame: Frame { x: cx, y: cy, angle: 0.0, scale: 1.0 }, kind: ShapeKind::Land }
 }
 
 fn world(shapes: &[Shape]) -> Engine {
@@ -216,7 +216,13 @@ fn moving_a_shape_keeps_its_coastline() {
 // --- fill in, and water shapes ----------------------------------------------
 
 fn lake(id: u32, cx: f32, cy: f32, r: f32, seed: u32) -> Shape {
-    Shape { water: true, ..island(id, cx, cy, r, seed) }
+    Shape { kind: ShapeKind::Water, ..island(id, cx, cy, r, seed) }
+}
+
+/// Signed distance to the coast at a world position: negative means water.
+fn shore_km(e: &Engine, x: f32, y: f32) -> f32 {
+    let cell = EXTENT_KM / SIZE as f32;
+    e.shore()[((y / cell) as u32 * SIZE + (x / cell) as u32) as usize]
 }
 
 /// Elevation at a world position (km) on a whole-map engine.
@@ -261,7 +267,7 @@ fn everything_drawn_as_water_is_water() {
     let water = lake(2, 800.0, 800.0, 220.0, 8);
     let e = world(&[continent, water.clone()]);
     for p in just_inside(&water) {
-        assert!(at_km(&e, p[0], p[1]) < 0.0, "land inside the drawn lake at {p:?}");
+        assert!(shore_km(&e, p[0], p[1]) < 0.0, "land inside the drawn lake at {p:?}");
     }
     // Inside the continent's drawn edge (about y = 1243 here) and beyond the
     // furthest the lake can grow (its edge is near y = 1022, plus at most 82 km).
@@ -274,7 +280,7 @@ fn island_in_a_lake_in_a_continent() {
     let e = world(&shapes);
     assert!(at_km(&e, 800.0, 800.0) > 0.0, "island");
     // Inside the lake's drawn edge (y = 1022) but beyond the island's furthest growth.
-    assert!(at_km(&e, 800.0, 960.0) < 0.0, "lake");
+    assert!(shore_km(&e, 800.0, 960.0) < 0.0, "lake");
     // Inside the continent's drawn edge (y = 1243) and beyond the lake's furthest growth.
     assert!(at_km(&e, 800.0, 1200.0) > 0.0, "continent");
 }
@@ -284,15 +290,15 @@ fn kind_and_order_changes_match_full_regeneration() {
     let mut shapes = vec![island(1, 800.0, 800.0, 600.0, 1), lake(2, 750.0, 750.0, 250.0, 2), island(3, 1300.0, 300.0, 150.0, 3)];
     let mut live = world(&shapes);
 
-    shapes[1].water = false; // lake becomes land
+    shapes[1].kind = ShapeKind::Land; // lake becomes land
     live.set_shapes(99, shapes.clone());
     assert_same(&live, &world(&shapes));
 
-    shapes[2].water = true; // island becomes water
+    shapes[2].kind = ShapeKind::Water; // island becomes water
     live.set_shapes(99, shapes.clone());
     assert_same(&live, &world(&shapes));
 
-    shapes[1].water = true;
+    shapes[1].kind = ShapeKind::Water;
     shapes.swap(0, 1); // the lake now comes first, so the continent covers it
     live.set_shapes(99, shapes.clone());
     assert_same(&live, &world(&shapes));
@@ -381,6 +387,109 @@ fn scaled_shape_edits_match_full_regeneration() {
     live.set_shapes(99, shapes.clone());
     assert_same(&live, &world(&shapes));
     shapes[2].frame.scale = 1.5;
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+}
+
+// --- highlands, escarpments and lakes on high ground ----------------------------
+
+fn highland(id: u32, cx: f32, cy: f32, r: f32, seed: u32, height: f32, slope_km: f32) -> Shape {
+    let mut s = Shape { kind: ShapeKind::Highland(height), ..island(id, cx, cy, r, seed) };
+    for p in s.coast.params.iter_mut() {
+        p.shore_km = slope_km;
+        p.reach_km = 10.0;
+    }
+    s
+}
+
+#[test]
+fn highland_raises_the_land_inside_it() {
+    let land = island(1, 800.0, 800.0, 600.0, 1);
+    let flat = world(&[land.clone()]);
+    let raised = world(&[land, highland(2, 800.0, 800.0, 250.0, 2, 1200.0, 4.0)]);
+    let inside = at_km(&raised, 800.0, 800.0) - at_km(&flat, 800.0, 800.0);
+    assert!((inside - 1200.0).abs() < 1.0, "raised by {inside} m");
+    let outside = at_km(&raised, 800.0, 1200.0) - at_km(&flat, 800.0, 1200.0);
+    assert!(outside.abs() < 1e-3, "outside the highland changed by {outside} m");
+}
+
+#[test]
+fn short_slope_is_a_cliff_and_long_slope_a_ramp() {
+    // Steepest rise between neighbouring cells across the escarpment.
+    let steepest = |slope_km: f32| {
+        let land = island(1, 800.0, 800.0, 650.0, 1);
+        let e = world(&[land, highland(2, 800.0, 800.0, 300.0, 2, 1500.0, slope_km)]);
+        // Only across the escarpment: the island's own coast is ~650 km out,
+        // the escarpment ~300 km, so stay within 450 km of the centre.
+        let cell = EXTENT_KM / SIZE as f32;
+        let (from, to) = (((800.0 - 450.0) / cell) as u32, ((800.0 + 450.0) / cell) as u32);
+        let mut worst = 0.0f32;
+        for x in from..to {
+            let i = (SIZE / 2) * SIZE + x;
+            worst = worst.max((e.elevation()[i as usize + 1] - e.elevation()[i as usize]).abs());
+        }
+        worst
+    };
+    let cliff = steepest(0.1);
+    let ramp = steepest(30.0);
+    assert!(cliff > 900.0, "cliff steepest step {cliff} m");
+    assert!(ramp < 150.0, "ramp steepest step {ramp} m");
+}
+
+#[test]
+fn lake_on_a_plateau_stays_on_the_plateau() {
+    let shapes = vec![
+        island(1, 800.0, 800.0, 650.0, 1),
+        highland(2, 800.0, 800.0, 400.0, 2, 900.0, 5.0),
+        lake(3, 800.0, 800.0, 120.0, 3),
+    ];
+    let e = world(&shapes);
+    let cell = EXTENT_KM / SIZE as f32;
+    let i = ((800.0 / cell) as u32 * SIZE + (800.0 / cell) as u32) as usize;
+    assert!(e.shore()[i] < 0.0, "the lake is water");
+    assert!((e.surface()[i] - 900.0).abs() < 1.0, "lake surface {} m", e.surface()[i]);
+    assert!(e.elevation()[i] < e.surface()[i], "lake bed below its surface");
+    assert!(e.elevation()[i] > 0.0, "and still far above sea level");
+}
+
+#[test]
+fn highland_crossing_the_coast_makes_sea_cliffs_not_land() {
+    // A highland hanging off the edge of an island: the sea stays sea.
+    let shapes = vec![island(1, 700.0, 800.0, 400.0, 1), highland(2, 1100.0, 800.0, 250.0, 2, 800.0, 2.0)];
+    let e = world(&shapes);
+    assert!(shore_km(&e, 1300.0, 800.0) < 0.0, "sea beyond the island");
+    let cell = EXTENT_KM / SIZE as f32;
+    let i = ((800.0 / cell) as u32 * SIZE + (1300.0 / cell) as u32) as usize;
+    assert_eq!(e.surface()[i], 0.0, "the sea is at sea level");
+    assert!(at_km(&e, 1000.0, 800.0) > 700.0, "the island's raised part");
+}
+
+#[test]
+fn negative_highland_is_a_basin_and_stays_land() {
+    let shapes = vec![island(1, 800.0, 800.0, 600.0, 1), highland(2, 800.0, 800.0, 200.0, 2, -900.0, 20.0)];
+    let e = world(&shapes);
+    assert!(at_km(&e, 800.0, 800.0) < 0.0, "below sea level");
+    assert!(shore_km(&e, 800.0, 800.0) > 0.0, "but still land, not sea");
+}
+
+#[test]
+fn highland_edits_match_full_regeneration() {
+    let mut shapes = vec![
+        island(1, 800.0, 800.0, 650.0, 1),
+        highland(2, 750.0, 750.0, 350.0, 2, 900.0, 3.0),
+        lake(3, 700.0, 700.0, 100.0, 3),
+    ];
+    let mut live = world(&shapes);
+    shapes[1].kind = ShapeKind::Highland(1500.0); // height
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+    shapes[1].coast.params[3].shore_km = 25.0; // edge slope on one segment
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+    shapes[1].coast.points[2][0] += 40.0; // drag an escarpment point
+    live.set_shapes(99, shapes.clone());
+    assert_same(&live, &world(&shapes));
+    shapes.remove(1); // remove the highland: the lake drops back to sea level
     live.set_shapes(99, shapes.clone());
     assert_same(&live, &world(&shapes));
 }

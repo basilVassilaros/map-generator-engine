@@ -7,16 +7,17 @@
 //! Guide encoding (all f32):
 //!   [world_seed, edge_smoothing_px, shape_count, shape...]
 //! and each shape is
-//!   [id, seed, frame_x, frame_y, frame_angle, frame_scale, water, n,
+//!   [id, seed, frame_x, frame_y, frame_angle, frame_scale, kind, height, n,
 //!    x0, y0, ..., x(n-1), y(n-1), then per segment r, c, s, g, i]
 //! where x/y are kilometres, r = roughness, c = coves, s = shore distance (km),
-//! g = reach outside the line (km), i = reach inside the line (km), water is 1 for a lake or sea and 0 for land, and the
+//! g = reach outside the line (km), i = reach inside the line (km), kind is 0 for land, 1 for water and 2 for a highland raised by `height`
+//! metres, and the
 //! frame anchors the shape's coastline detail. Shapes combine in list order. Seeds and ids must be
 //! below 2^24 so they survive the trip through f32 exactly.
 
 use std::cell::RefCell;
 
-use crate::coast::{Coastline, Frame, SegmentParams, Shape};
+use crate::coast::{Coastline, Frame, SegmentParams, Shape, ShapeKind};
 use crate::engine::{Engine, Rect};
 
 thread_local! {
@@ -99,12 +100,12 @@ fn decode_shapes(data: &[f32]) -> (u32, f32, Vec<Shape>) {
     let count = data[2] as usize;
     let mut at = 3;
     for _ in 0..count {
-        if data.len() < at + 8 {
+        if data.len() < at + 9 {
             break;
         }
-        let head = &data[at..at + 8];
-        let n = head[7] as usize;
-        let body = at + 8;
+        let head = &data[at..at + 9];
+        let n = head[8] as usize;
+        let body = at + 9;
         if data.len() < body + n * 7 {
             break;
         }
@@ -113,7 +114,11 @@ fn decode_shapes(data: &[f32]) -> (u32, f32, Vec<Shape>) {
         shapes.push(Shape {
             id: head[0] as u32,
             frame: Frame { x: head[2], y: head[3], angle: head[4], scale: head[5] },
-            water: head[6] != 0.0,
+            kind: match head[6] as u32 {
+                1 => ShapeKind::Water,
+                2 => ShapeKind::Highland(head[7]),
+                _ => ShapeKind::Land,
+            },
             coast: Coastline {
                 points: pts.chunks_exact(2).map(|p| [p[0], p[1]]).collect(),
                 params: prm

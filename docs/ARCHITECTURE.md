@@ -48,6 +48,20 @@ furthest inland decides the terrain), water shapes cut water out of whatever
 came before them. The app sorts shapes by nesting, so a lake inside a
 continent cuts into it and an island inside that lake adds land back.
 
+**Highland** shapes don't take part in that land/water ordering. Each adds a
+rise (its height, which may be negative) to the land inside it, with an
+escarpment whose steepness comes from the segment's slope setting. They only
+ever affect land, so a highland crossing the coast makes sea cliffs rather
+than new land. Nested highlands add up, making terraces.
+
+**Water is tracked separately from elevation.** Each cell records whether it
+is water (from its signed distance to the final coastline) and, if so, the
+height of its surface: sea level for the ocean, the surrounding ground for a
+lake, which therefore sits on top of any highland it's drawn on. Lakes use a
+shallower depth profile than the ocean (at most 300 m). Land below sea level
+in a basin stays land. The renderer colours water by depth below its own
+surface and only uses beach colours next to actual water.
+
 By default the drawn line is the **inner edge** of every coast. Each segment
 has a Reach outside and a Reach inside; the coast stays between the two
 (roughness only ever adds outward). With Reach inside at zero, the default,

@@ -53,6 +53,8 @@
           <button id="new-shape" class="small">New shape</button>
         </div>
         <ul id="shape-list" class="shape-list" aria-label="Coastline shapes"></ul>
+        <button id="import-image" class="link-btn">Import an image to trace…</button>
+        <input id="import-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml" hidden>
         <p id="guidance" class="guidance" aria-live="polite"></p>
       </section>
 
@@ -67,8 +69,14 @@
           <div class="segmented" role="group" aria-labelledby="kind-label">
             <button id="kind-land" aria-pressed="true">Land</button>
             <button id="kind-water" aria-pressed="false">Water</button>
+            <button id="kind-highland" aria-pressed="false">Highland</button>
           </div>
-          <p class="hint">Water shapes become lakes, seas and bays. Land drawn inside water becomes an island.</p>
+          <p id="kind-hint" class="hint"></p>
+        </div>
+        <div id="height-field" class="field" hidden>
+          <div class="field-head"><label for="height">Height</label><output id="height-value"></output></div>
+          <input id="height" type="range" min="-2000" max="4000" step="50">
+          <p class="hint">How far the highland rises above the land around it. Negative heights make a basin.</p>
         </div>
         <h3 class="subhead">Coastline, all segments</h3>
         <p class="hint subhead-hint">Changes every segment. Segments you've adjusted keep their own difference on top.</p>
@@ -76,6 +84,20 @@
         <p id="shape-facts" class="hint"></p>
         <p id="shape-help" class="hint"></p>
         <button id="delete-shape" class="quiet danger">Delete shape</button>
+      </section>
+
+      <section id="reference-panel" class="block" hidden>
+        <h2>Reference image</h2>
+        <p id="reference-name" class="hint reference-name"></p>
+        <div class="field">
+          <div class="field-head"><label for="reference-opacity">Opacity</label><output id="reference-opacity-value"></output></div>
+          <input id="reference-opacity" type="range" min="5" max="100" step="1">
+        </div>
+        <p id="reference-help" class="hint"></p>
+        <div class="button-row">
+          <button id="reference-replace" class="quiet">Replace…</button>
+          <button id="reference-remove" class="quiet danger">Remove</button>
+        </div>
       </section>
 
       <section id="segment-panel" class="block" hidden>
@@ -96,17 +118,47 @@
         <div class="field">
           <div class="field-head"><label for="resolution">Working resolution</label></div>
           <select id="resolution">
-            <option value="512">512 × 512 (3.1 km per pixel)</option>
-            <option value="1024" selected>1024 × 1024 (1.6 km per pixel)</option>
-            <option value="2048">2048 × 2048 (0.8 km per pixel)</option>
+            <option value="512">512 × 512</option>
+            <option value="1024" selected>1024 × 1024</option>
+            <option value="2048">2048 × 2048</option>
           </select>
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="map-width">Map width</label></div>
+          <div class="inline-input">
+            <input id="map-width" type="number" min="50" max="40000" step="50" value="1600" inputmode="numeric">
+            <span>km</span>
+            <button id="map-width-apply" class="small" hidden>Apply</button>
+          </div>
+          <div id="map-width-choice" class="width-choice" hidden>
+            <p class="hint">You have shapes on the map. Should they…</p>
+            <button id="width-keep" class="quiet">Keep their real size</button>
+            <button id="width-scale" class="quiet">Scale with the map</button>
+          </div>
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="grid">Grid squares</label></div>
+          <div class="inline-input">
+            <select id="grid">
+              <option value="0" selected>Automatic</option>
+              <option value="10">10 km</option>
+              <option value="25">25 km</option>
+              <option value="50">50 km</option>
+              <option value="100">100 km</option>
+              <option value="250">250 km</option>
+              <option value="500">500 km</option>
+              <option value="1000">1,000 km</option>
+            </select>
+            <label class="check"><input id="show-grid" type="checkbox" checked> Show</label>
+          </div>
         </div>
         <div class="field">
           <div class="field-head"><label for="smoothing">Edge smoothing</label><output id="smoothing-value"></output></div>
           <input id="smoothing" type="range" min="0" max="3" step="0.25" value="1">
           <p class="hint">Anti-aliasing for coastlines: softens jagged pixel edges on the map and in exports.</p>
         </div>
-        <p class="hint">The map is 1,600 km across. Scroll or pinch to zoom; zoomed views are regenerated at full detail. Drag empty map, or hold Space and drag, to pan.</p>
+        <p id="map-facts" class="hint"></p>
+        <p class="hint">Scroll or pinch to zoom; zoomed views are regenerated at full detail. Drag empty map, or hold Space and drag, to pan.</p>
       </section>
 
       <section class="block timing-block">
@@ -130,9 +182,9 @@
     <div id="full-options" class="field" hidden>
       <div class="field-head"><label for="full-size">Size</label></div>
       <select id="full-size">
-        <option value="4096">4096 × 4096 (390 m per pixel)</option>
-        <option value="8192" selected>8192 × 8192 (195 m per pixel)</option>
-        <option value="16384">16384 × 16384 (98 m per pixel)</option>
+        <option value="4096">4096 × 4096</option>
+        <option value="8192" selected>8192 × 8192</option>
+        <option value="16384">16384 × 16384</option>
       </select>
       <p id="full-estimate" class="hint"></p>
     </div>

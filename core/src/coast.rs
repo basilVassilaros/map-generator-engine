@@ -129,6 +129,23 @@ impl Frame {
     }
 }
 
+/// What a shape does to the map.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShapeKind {
+    /// Adds land.
+    Land,
+    /// Cuts water (a lake, sea or bay) out of land. Its surface sits at the
+    /// level of the ground around it, so a lake on a plateau stays up there.
+    Water,
+    /// Raises the land inside it by this many metres (negative lowers it),
+    /// with an escarpment around the edge. Only affects land.
+    Highland(f32),
+}
+
+/// Highland heights are limited to this range (metres).
+pub const MIN_HIGHLAND_M: f32 = -2000.0;
+pub const MAX_HIGHLAND_M: f32 = 4000.0;
+
 /// One closed outline drawn by the user, with its own identity and frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shape {
@@ -136,8 +153,25 @@ pub struct Shape {
     pub id: u32,
     pub coast: Coastline,
     pub frame: Frame,
-    /// Water shapes (lakes, seas) cut water out of land instead of adding land.
-    pub water: bool,
+    pub kind: ShapeKind,
+}
+
+impl Shape {
+    pub fn is_highland(&self) -> bool {
+        matches!(self.kind, ShapeKind::Highland(_))
+    }
+}
+
+/// How far up a highland's edge a cell is: 0 outside, rising to 1 over
+/// 3x the edge slope distance (`shore_km`), so a short slope is a cliff and a
+/// long one a gentle ramp. Flat beyond INFLUENCE_KM, like the coast profile.
+pub fn highland_rise(signed_km: f32, p: &SegmentParams) -> f32 {
+    if signed_km <= 0.0 {
+        return 0.0;
+    }
+    let s = (signed_km / (3.0 * p.shore_km)).min(1.0);
+    // Smooth at both the foot and the top of the slope.
+    s * s * (3.0 - 2.0 * s)
 }
 
 /// Fraction of each segment at either end that blends into the neighbouring
@@ -262,7 +296,8 @@ pub fn coastal_displacement(b: &CoastBands, p: &SegmentParams) -> f32 {
 
 /// Elevation (metres) for a cell `signed_km` from the shoreline
 /// (positive inland, negative at sea).
-/// `base` is the lowland height from `inland_base`.
+/// Elevation relative to the local water surface: `base` is the lowland
+/// height from `inland_base`; land rises from the shore, water deepens.
 pub fn elevation_from_coast(base: f32, signed_km: f32, p: &SegmentParams) -> f32 {
     if signed_km >= 0.0 {
         // Rises over 3x the shore distance, then stays flat. A short distance
@@ -278,6 +313,16 @@ pub fn elevation_from_coast(base: f32, signed_km: f32, p: &SegmentParams) -> f32
         let abyss = 3500.0 * smoothstep(50.0, INFLUENCE_KM, out);
         -(shelf + abyss)
     }
+}
+
+/// Depth (metres, negative) of a lake or inland sea below its own surface,
+/// `signed_km` from its shore (negative inside the water). Shallower than the
+/// ocean: deepening over the shelf width, to at most 300 m. Flat beyond
+/// INFLUENCE_KM, like the other profiles.
+pub fn lake_depth(signed_km: f32, p: &SegmentParams) -> f32 {
+    let out = (-signed_km).max(0.0);
+    let shelf_width = 2.0 * p.shore_km + 8.0;
+    -(15.0 + 285.0 * smoothstep(0.0, shelf_width.max(40.0), out))
 }
 
 /// Gently varying lowland height, independent of the coastline.

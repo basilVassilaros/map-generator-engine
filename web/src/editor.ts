@@ -14,10 +14,17 @@ export interface ShapeFrame {
   scale: number;
 }
 
+export type ShapeKindName = "land" | "water" | "highland";
+
+const KIND_NAMES: Record<ShapeKindName, string> = { land: "Landmass", water: "Lake", highland: "Highland" };
+export const DEFAULT_HIGHLAND_M = 800;
+
 export interface ShapeModel {
   id: number;
   name: string;
-  kind: "land" | "water";
+  kind: ShapeKindName;
+  /** For highlands: metres above (or, if negative, below) the land around. */
+  height: number;
   points: Vec2[];
   /** Coastline slider values for the whole shape. */
   base: SliderValues;
@@ -30,19 +37,44 @@ export interface ShapeModel {
   locked: boolean;
 }
 
+/** A picture shown over the map to trace from. Never part of the terrain or exports. */
+export interface ReferenceImage {
+  image: HTMLImageElement;
+  name: string;
+  /** Centre (km), size (km) and rotation (radians). */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  angle: number;
+  opacity: number;
+  hidden: boolean;
+  locked: boolean;
+}
+
+type ImageBox = Pick<ReferenceImage, "x" | "y" | "w" | "h" | "angle">;
+
 export type Selection =
   | { kind: "shape"; shape: number }
-  | { kind: "segment"; shape: number; index: number }
+  /** One or more segments of one shape; `index` is the most recently clicked. */
+  | { kind: "segment"; shape: number; index: number; indices?: number[] }
   | { kind: "point"; shape: number; index: number }
   | null;
 
 /** What changed: terrain ("shape"), only the selection, or only the shape list. */
 export type EditKind = "shape" | "selection" | "list";
 
+/** Every segment in a selection, in the order they were added. */
+export function selectedSegments(sel: Selection): number[] {
+  if (sel?.kind !== "segment") return [];
+  return sel.indices?.length ? sel.indices : [sel.index];
+}
+
 type Corner = 0 | 1 | 2 | 3; // top-left, top-right, bottom-right, bottom-left
 
 type Drag =
   | { kind: "point"; shape: number; index: number }
+  | { kind: "image"; mode: "move" | "rotate" | { corner: Corner }; start: Vec2; from: ImageBox; moved: boolean }
   | { kind: "pan"; x: number; y: number; moved: boolean; onClick: "deselect" | "undo-point" | "none" }
   | {
       kind: "transform";
@@ -70,6 +102,7 @@ const DRAG_THRESHOLD_PX = 4;
 
 const GUIDE = "#ffffff";
 const WATER_GUIDE = "#8fdcff";
+const HIGHLAND_GUIDE = "#ffc978";
 const HIGHLIGHT = "#f2b01e";
 const HALO = "rgba(10, 20, 28, 0.45)";
 
@@ -113,6 +146,12 @@ export class CoastEditor {
   /** Points of the shape being drawn, or null when not drawing. */
   draft: Vec2[] | null = [];
   selection: Selection = null;
+  /** The reference image, if one has been imported, and whether it is selected. */
+  reference: ReferenceImage | null = null;
+  referenceSelected = false;
+  /** Grid spacing in km, or 0 to choose automatically from the zoom. */
+  gridKm = 0;
+  showGrid = true;
   readonly worldSeed = newSeed();
   onEdit: (kind: EditKind) => void = () => {};
   /** Drag to pan, in CSS pixels. */
@@ -201,7 +240,8 @@ export class CoastEditor {
         id: s.id,
         seed: s.seed,
         frame: s.frame,
-        water: s.kind === "water",
+        kind: s.kind,
+        height: s.kind === "highland" ? s.height : 0,
         points: s.points,
         params: s.adjust.map((a) => toParams(effective(s.base, a))),
       })),
@@ -229,7 +269,73 @@ export class CoastEditor {
   select(selection: Selection): void {
     if (this.draft && this.shapes.length) this.draft = null;
     this.selection = selection;
+    this.referenceSelected = false;
     this.onEdit("selection");
+    this.draw();
+  }
+
+  // --- the reference image ---
+
+  /** Show an image to trace from, fitted to the map and selected. */
+  setReference(image: HTMLImageElement, name: string): void {
+    const aspect = image.naturalHeight / (image.naturalWidth || 1);
+    const w = aspect > 1 ? this.extentKm / aspect : this.extentKm;
+    this.reference = { image, name, x: this.extentKm / 2, y: this.extentKm / 2, w, h: w * aspect, angle: 0, opacity: 0.6, hidden: false, locked: false };
+    this.selectReference();
+  }
+
+  selectReference(): void {
+    if (!this.reference) return;
+    if (this.draft && this.shapes.length) this.draft = null;
+    this.selection = null;
+    this.referenceSelected = true;
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  updateReference(change: Partial<Pick<ReferenceImage, "opacity" | "hidden" | "locked">>): void {
+    if (!this.reference) return;
+    Object.assign(this.reference, change);
+    this.onEdit("list");
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  removeReference(): void {
+    this.reference = null;
+    this.referenceSelected = false;
+    this.onEdit("list");
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  // --- map size ---
+
+  get mapWidthKm(): number {
+    return this.extentKm;
+  }
+
+  /**
+   * Change the real width of the map. With `scaleContent`, every shape (and
+   * the reference image) scales with the map, staying where it is on the
+   * canvas; coastlines scale exactly with their shapes. Otherwise everything
+   * keeps its real size and position from the map's top-left corner.
+   */
+  setMapWidth(km: number, scaleContent: boolean): void {
+    const r = km / this.extentKm;
+    this.extentKm = km;
+    if (scaleContent && r !== 1) {
+      for (const s of this.shapes) {
+        s.points = s.points.map((p) => ({ x: p.x * r, y: p.y * r }));
+        s.frame = { ...s.frame, x: s.frame.x * r, y: s.frame.y * r, scale: s.frame.scale * r };
+      }
+      if (this.draft) this.draft = this.draft.map((p) => ({ x: p.x * r, y: p.y * r }));
+      if (this.reference) {
+        const ref = this.reference;
+        Object.assign(ref, { x: ref.x * r, y: ref.y * r, w: ref.w * r, h: ref.h * r });
+      }
+    }
+    this.onEdit("shape");
     this.draw();
   }
 
@@ -240,16 +346,24 @@ export class CoastEditor {
     this.onEdit("list");
   }
 
-  /** Make a shape land or water. Default names follow the kind. */
-  setKind(id: number, kind: "land" | "water"): void {
+  /** Make a shape land, water or highland. Default names follow the kind. */
+  setKind(id: number, kind: ShapeKindName): void {
     const s = this.shape(id);
     if (!s || s.locked || s.kind === kind) return;
     s.kind = kind;
-    const match = /^(Landmass|Lake) (\d+)$/.exec(s.name);
-    if (match) s.name = `${kind === "water" ? "Lake" : "Landmass"} ${match[2]}`;
+    const match = /^(Landmass|Lake|Highland) (\d+)$/.exec(s.name);
+    if (match) s.name = `${KIND_NAMES[kind]} ${match[2]}`;
     this.onEdit("shape");
     this.onEdit("selection");
     this.draw();
+  }
+
+  /** A highland's height in metres; negative makes a basin. */
+  setHeight(id: number, metres: number): void {
+    const s = this.shape(id);
+    if (!s || s.locked) return;
+    s.height = metres;
+    this.onEdit("shape");
   }
 
   toggleHidden(id: number): void {
@@ -313,11 +427,23 @@ export class CoastEditor {
     this.onEdit("shape");
   }
 
-  /** Remove a segment's own adjustment, so it follows its shape exactly. */
-  resetSegment(index: number): void {
+  /** Set several segments' values at once (one update for the terrain). */
+  setManySegmentValues(changes: [index: number, values: SliderValues][]): void {
     const s = this.selectedShape();
     if (!s || s.locked) return;
-    s.adjust[index] = { ...NO_ADJUSTMENT };
+    for (const [index, values] of changes) {
+      const adjust = {} as SliderValues;
+      for (const k of Object.keys(values) as (keyof SliderValues)[]) adjust[k] = values[k] - s.base[k];
+      s.adjust[index] = adjust;
+    }
+    this.onEdit("shape");
+  }
+
+  /** Remove segments' own adjustments, so they follow their shape exactly. */
+  resetSegments(indices: number[]): void {
+    const s = this.selectedShape();
+    if (!s || s.locked) return;
+    for (const i of indices) s.adjust[i] = { ...NO_ADJUSTMENT };
     this.onEdit("shape");
     this.onEdit("selection");
   }
@@ -368,6 +494,97 @@ export class CoastEditor {
   /** Shapes that can be clicked on the map: visible and not locked, topmost first. */
   private editable(): ShapeModel[] {
     return this.shapes.filter((s) => !s.hidden && !s.locked).reverse();
+  }
+
+  // --- the reference image's box ----------------------------------------------------
+
+  /** Corners (km) of an image box: top-left, top-right, bottom-right, bottom-left in its own frame. */
+  private imageCorners(b: ImageBox): Vec2[] {
+    const cos = Math.cos(b.angle);
+    const sin = Math.sin(b.angle);
+    return [
+      [-1, -1],
+      [1, -1],
+      [1, 1],
+      [-1, 1],
+    ].map(([sx, sy]) => ({
+      x: b.x + (sx * b.w * cos) / 2 - (sy * b.h * sin) / 2,
+      y: b.y + (sx * b.w * sin) / 2 + (sy * b.h * cos) / 2,
+    }));
+  }
+
+  /** Handles of the image box in screen pixels: four corners and the rotate knob. */
+  private imageHandles(b: ImageBox): { corners: Vec2[]; rotate: Vec2; topMid: Vec2 } {
+    const corners = this.imageCorners(b).map((c) => this.toPx(c));
+    const topMid = { x: (corners[0].x + corners[1].x) / 2, y: (corners[0].y + corners[1].y) / 2 };
+    // Out from the top edge, perpendicular to it.
+    const up = { x: Math.sin(b.angle), y: -Math.cos(b.angle) };
+    return { corners, topMid, rotate: { x: topMid.x + up.x * ROTATE_OFFSET_PX, y: topMid.y + up.y * ROTATE_OFFSET_PX } };
+  }
+
+  private hitImage(e: PointerEvent | MouseEvent, b: ImageBox): "rotate" | Corner | "inside" | null {
+    const r = this.overlay.getBoundingClientRect();
+    const sx = e.clientX - r.left;
+    const sy = e.clientY - r.top;
+    const { corners, rotate } = this.imageHandles(b);
+    if (Math.hypot(sx - rotate.x, sy - rotate.y) <= HANDLE_HIT_PX) return "rotate";
+    for (let i = 0; i < 4; i++) {
+      if (Math.hypot(sx - corners[i].x, sy - corners[i].y) <= HANDLE_HIT_PX) return i as Corner;
+    }
+    // Inside: the point in the image's own frame lies within half its size.
+    const p = this.toKm(e);
+    const dx = p.x - b.x;
+    const dy = p.y - b.y;
+    const u = dx * Math.cos(b.angle) + dy * Math.sin(b.angle);
+    const v = -dx * Math.sin(b.angle) + dy * Math.cos(b.angle);
+    return Math.abs(u) <= b.w / 2 && Math.abs(v) <= b.h / 2 ? "inside" : null;
+  }
+
+  /** The reference image, if it is selected and free to move. */
+  private movableReference(): ReferenceImage | null {
+    const ref = this.reference;
+    return ref && this.referenceSelected && !ref.locked && !ref.hidden ? ref : null;
+  }
+
+  private transformImage(drag: Extract<Drag, { kind: "image" }>, p: Vec2): void {
+    const ref = this.reference;
+    if (!ref) return;
+    const dx = p.x - drag.start.x;
+    const dy = p.y - drag.start.y;
+    if (!drag.moved && Math.hypot(dx, dy) / this.kmPerPx() < DRAG_THRESHOLD_PX) return;
+    drag.moved = true;
+    const b = drag.from;
+    if (drag.mode === "move") {
+      Object.assign(ref, { x: b.x + dx, y: b.y + dy });
+    } else if (drag.mode === "rotate") {
+      let angle = Math.atan2(p.y - b.y, p.x - b.x) - Math.atan2(drag.start.y - b.y, drag.start.x - b.x);
+      if (this.shiftHeld) angle = Math.round(angle / (Math.PI / 12)) * (Math.PI / 12);
+      ref.angle = b.angle + angle;
+    } else {
+      // Resize from the opposite corner, measured along the image's own axes.
+      const k = drag.mode.corner;
+      const signs: [number, number][] = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+      const [sx, sy] = signs[k];
+      const anchor = this.imageCorners(b)[(k + 2) % 4];
+      const cos = Math.cos(b.angle);
+      const sin = Math.sin(b.angle);
+      const ax = p.x - anchor.x;
+      const ay = p.y - anchor.y;
+      const minKm = 5;
+      let w = Math.max(minKm, (ax * cos + ay * sin) * sx);
+      let h = Math.max(minKm, (-ax * sin + ay * cos) * sy);
+      if (!this.shiftHeld) {
+        const f = Math.max(w / b.w, h / b.h);
+        w = b.w * f;
+        h = b.h * f;
+      }
+      Object.assign(ref, {
+        w,
+        h,
+        x: anchor.x + (sx * w * cos) / 2 - (sy * h * sin) / 2,
+        y: anchor.y + (sx * w * sin) / 2 + (sy * h * cos) / 2,
+      });
+    }
   }
 
   // --- hit testing ------------------------------------------------------------------
@@ -479,6 +696,18 @@ export class CoastEditor {
       return;
     }
 
+    // A selected, unlocked reference image: its handles, or drag it from inside.
+    const ref = this.movableReference();
+    if (ref) {
+      const hit = this.hitImage(e, ref);
+      if (hit !== null) {
+        const mode = hit === "inside" ? "move" : hit === "rotate" ? "rotate" : { corner: hit };
+        this.drag = { kind: "image", mode, start: p, from: { x: ref.x, y: ref.y, w: ref.w, h: ref.h, angle: ref.angle }, moved: false };
+        this.overlay.setPointerCapture(e.pointerId);
+        return;
+      }
+    }
+
     // Handles of a selected whole shape come first.
     const selected = this.selectedShape();
     if (selected && this.selection?.kind === "shape" && !selected.locked && !selected.hidden) {
@@ -503,11 +732,22 @@ export class CoastEditor {
     // Then segments of any shape.
     const seg = this.hitSegment(p);
     if (seg) {
-      this.selection = { kind: "segment", shape: seg.shape.id, index: seg.index };
+      const sel = this.selection;
+      if ((e.ctrlKey || e.metaKey) && sel?.kind === "segment" && sel.shape === seg.shape.id) {
+        // Ctrl/Cmd+Click adds or removes a segment of the same shape.
+        const indices = selectedSegments(sel).filter((i) => i !== seg.index);
+        if (indices.length === selectedSegments(sel).length) indices.push(seg.index);
+        this.selection = indices.length ? { kind: "segment", shape: seg.shape.id, index: indices[indices.length - 1], indices } : null;
+      } else {
+        this.selection = { kind: "segment", shape: seg.shape.id, index: seg.index, indices: [seg.index] };
+      }
       this.onEdit("selection");
       this.draw();
       return;
     }
+
+    // Ctrl/Cmd+Click elsewhere keeps a segment selection rather than clearing it.
+    if ((e.ctrlKey || e.metaKey) && this.selection?.kind === "segment") return;
 
     // Inside the selected shape's box: drag to move it.
     if (selected && this.selection?.kind === "shape" && !selected.locked && this.hitHandle(e, selected) === "inside") {
@@ -547,6 +787,7 @@ export class CoastEditor {
       id: this.nextId++,
       name: `Landmass ${this.nextNumber++}`,
       kind: "land",
+      height: DEFAULT_HIGHLAND_M,
       points,
       base: { ...DEFAULT_VALUES },
       adjust: points.map(() => ({ ...NO_ADJUSTMENT })),
@@ -586,6 +827,8 @@ export class CoastEditor {
       }
     } else if (drag?.kind === "transform") {
       this.transform(drag, p);
+    } else if (drag?.kind === "image") {
+      this.transformImage(drag, p);
     } else {
       this.hover = this.hoverAt(e, p);
     }
@@ -663,12 +906,13 @@ export class CoastEditor {
       if (drag.onClick === "undo-point" && this.draft?.length) {
         this.draft.pop();
         this.onEdit("selection");
-      } else if (drag.onClick === "deselect" && this.selection) {
+      } else if (drag.onClick === "deselect" && (this.selection || this.referenceSelected)) {
         this.selection = null;
+        this.referenceSelected = false;
         this.onEdit("selection");
       }
     }
-    if (drag.kind === "transform" || drag.kind === "point") this.onEdit("selection");
+    if (drag.kind === "transform" || drag.kind === "point" || drag.kind === "image") this.onEdit("selection");
     this.overlay.style.cursor = this.cursorStyle(e);
     this.draw();
   }
@@ -717,6 +961,7 @@ export class CoastEditor {
         this.cancelDraft();
       } else {
         this.selection = null;
+        this.referenceSelected = false;
         this.onEdit("selection");
       }
       this.draw();
@@ -736,9 +981,16 @@ export class CoastEditor {
   private cursorStyle(e?: PointerEvent): string {
     if (this.drag?.kind === "pan" && this.drag.moved) return "grabbing";
     if (this.drag?.kind === "point") return "grabbing";
-    if (this.drag?.kind === "transform") return this.drag.mode === "move" ? "grabbing" : "crosshair";
+    if (this.drag?.kind === "transform" || this.drag?.kind === "image") return this.drag.mode === "move" ? "grabbing" : "crosshair";
     if (this.spaceHeld) return "grab";
     if (this.draft) return this.hover?.kind === "point" ? "pointer" : "crosshair";
+    const ref = this.movableReference();
+    if (e && ref) {
+      const hit = this.hitImage(e, ref);
+      if (hit === "rotate") return "alias";
+      if (hit === "inside") return "move";
+      if (hit !== null) return "crosshair";
+    }
     const selected = this.selectedShape();
     if (e && selected && this.selection?.kind === "shape" && !selected.locked && !selected.hidden) {
       const handle = this.hitHandle(e, selected);
@@ -766,12 +1018,55 @@ export class CoastEditor {
     const ctx = this.ctx;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    this.drawGrid();
+    if (this.reference && !this.reference.hidden) this.drawReference(this.reference);
+    if (this.showGrid) this.drawGrid();
     for (const shape of this.shapes) if (!shape.hidden) this.drawShape(shape);
     const selected = this.selectedShape();
     if (selected && !selected.hidden && this.selection?.kind === "shape" && !selected.locked) this.drawHandles(selected);
+    const ref = this.movableReference();
+    if (ref) this.drawImageHandles(ref);
     if (this.draft) this.drawDraft(this.draft);
     this.drawScale();
+  }
+
+  private drawReference(ref: ReferenceImage): void {
+    const ctx = this.ctx;
+    const c = this.toPx(ref);
+    const s = this.view.size / this.extentKm;
+    ctx.save();
+    // Only the part over the map is useful for tracing.
+    ctx.beginPath();
+    ctx.rect(this.view.left, this.view.top, this.view.size, this.view.size);
+    ctx.clip();
+    ctx.globalAlpha = ref.opacity;
+    ctx.translate(c.x, c.y);
+    ctx.rotate(ref.angle);
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(ref.image, (-ref.w * s) / 2, (-ref.h * s) / 2, ref.w * s, ref.h * s);
+    ctx.restore();
+  }
+
+  private drawImageHandles(ref: ReferenceImage): void {
+    const ctx = this.ctx;
+    const { corners, rotate, topMid } = this.imageHandles(ref);
+    ctx.strokeStyle = HIGHLIGHT;
+    ctx.lineWidth = 1.25;
+    ctx.setLineDash([5, 4]);
+    this.path(corners, true);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(topMid.x, topMid.y);
+    ctx.lineTo(rotate.x, rotate.y);
+    ctx.stroke();
+    for (const corner of corners) this.square(corner, 5, "#ffffff");
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "rgba(10, 20, 28, 0.8)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(rotate.x, rotate.y, 5.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
   }
 
   /** A round distance (km) that spans at least `minPx` on screen. */
@@ -788,8 +1083,10 @@ export class CoastEditor {
     const { left, top, size } = this.view;
     const w = this.overlay.clientWidth;
     const h = this.overlay.clientHeight;
-    const step = this.niceKm(56);
     const pxPerKm = size / this.extentKm;
+    const step = this.gridKm || this.niceKm(56);
+    // A fixed grid too dense to see at this zoom is left out rather than drawn as a smear.
+    if (step * pxPerKm < 6) return;
     const kmAt = (px: number, origin: number) => (px - origin) / pxPerKm;
     const fromX = Math.max(step, Math.ceil(kmAt(0, left) / step) * step);
     const toX = Math.min(this.extentKm - step / 2, kmAt(w, left));
@@ -832,6 +1129,10 @@ export class CoastEditor {
     ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
     ctx.font = '500 12px "Barlow", system-ui, sans-serif';
     ctx.fillText(`${km.toLocaleString()} km`, x + len + 8, y + 1);
+    if (this.showGrid && this.gridKm) {
+      ctx.fillStyle = "rgba(255, 255, 255, 0.7)";
+      ctx.fillText(`Grid squares: ${this.gridKm.toLocaleString()} km`, x, y - 12);
+    }
   }
 
   private path(pts: Vec2[], closed: boolean): void {
@@ -853,7 +1154,7 @@ export class CoastEditor {
     ctx.lineWidth = focused ? 4 : 3;
     ctx.stroke();
     this.path(pts, true);
-    const ink = shape.kind === "water" ? WATER_GUIDE : GUIDE;
+    const ink = shape.kind === "water" ? WATER_GUIDE : shape.kind === "highland" ? HIGHLAND_GUIDE : GUIDE;
     ctx.strokeStyle = ink;
     ctx.globalAlpha = shape.locked ? 0.55 : focused || hovered ? 1 : 0.75;
     ctx.lineWidth = focused ? 1.75 : 1.25;
@@ -873,10 +1174,11 @@ export class CoastEditor {
       ctx.stroke();
     };
     const sel = this.selection;
-    if (this.hover?.kind === "segment" && this.hover.shape === shape.id && !(sel?.kind === "segment" && sel.shape === shape.id && sel.index === this.hover.index)) {
+    const chosen = sel?.kind === "segment" && sel.shape === shape.id ? selectedSegments(sel) : [];
+    if (this.hover?.kind === "segment" && this.hover.shape === shape.id && !chosen.includes(this.hover.index)) {
       segment(this.hover.index, "rgba(242, 176, 30, 0.55)", 4);
     }
-    if (sel?.kind === "segment" && sel.shape === shape.id) segment(sel.index, HIGHLIGHT, 4);
+    for (const i of chosen) segment(i, HIGHLIGHT, i === (sel as { index: number }).index ? 4.5 : 3.5);
 
     // Points only for the shape being edited, to keep the map uncluttered.
     if (focused && !shape.locked) {

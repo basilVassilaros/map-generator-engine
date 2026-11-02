@@ -8,11 +8,17 @@
 //! Shapes combine in list order, starting from open ocean: a land shape adds
 //! land, a water shape cuts water out of whatever came before it. The app
 //! orders shapes by nesting, so a lake inside a continent cuts into it and an
-//! island inside that lake adds land back.
+//! island inside that lake adds land back. Highland shapes then raise (or
+//! lower) the ground inside them, with an escarpment at the edge.
+//!
+//! Water is tracked separately from elevation: each cell knows whether it is
+//! water and, if so, the height of its surface. The ocean's surface is sea
+//! level; a lake's surface is the height of the ground it sits in, so a lake
+//! on a plateau stays on the plateau.
 
 use crate::coast::{
-    coast_bands, coastal_displacement, distance_to_segment, elevation_from_coast, inland_base,
-    CoastBands, Coastline, Frame, SegmentParams, Shape, CLAMP_KM,
+    coast_bands, coastal_displacement, distance_to_segment, elevation_from_coast, highland_rise,
+    inland_base, lake_depth, CoastBands, Coastline, Frame, SegmentParams, Shape, ShapeKind, CLAMP_KM,
 };
 use crate::render;
 
@@ -145,9 +151,13 @@ pub struct Engine {
     origin: [f32; 2],
     cell_km: f32,
     elevation: Vec<f32>,
-    /// Signed distance (km) to the final coastline: positive on land. Lets the
-    /// renderer blend land and water across the edge (edge smoothing).
+    /// Signed distance (km) to the final coastline: positive on land, negative
+    /// in water. Decides what is water, and lets the renderer blend land and
+    /// water across the edge (edge smoothing).
     shore: Vec<f32>,
+    /// Height (metres) of the water surface, for water cells: 0 for the
+    /// ocean, the surrounding ground's height for a lake.
+    surface: Vec<f32>,
     rgba: Vec<u8>,
     /// Width (pixels) of the land/water blend along coastlines. 0 = off.
     smoothing: f32,
@@ -179,6 +189,7 @@ impl Engine {
             cell_km,
             elevation: vec![EMPTY_ELEVATION; cells],
             shore: vec![-CLAMP_KM; cells],
+            surface: vec![0.0; cells],
             rgba: vec![0; cells * 4],
             smoothing: 0.0,
             world_seed: 0,
@@ -201,6 +212,16 @@ impl Engine {
 
     pub fn elevation(&self) -> &[f32] {
         &self.elevation
+    }
+
+    /// Signed distance (km) to the coastline: negative means water.
+    pub fn shore(&self) -> &[f32] {
+        &self.shore
+    }
+
+    /// Water surface height (metres) for water cells.
+    pub fn surface(&self) -> &[f32] {
+        &self.surface
     }
 
     pub fn rgba(&self) -> &[u8] {
@@ -231,7 +252,7 @@ impl Engine {
     /// Convenience for a single coastline (id 0, frame at the origin).
     pub fn set_coast(&mut self, coast: Option<Coastline>) -> Rect {
         let seed = coast.as_ref().map_or(0, |c| c.seed);
-        let shapes = coast.into_iter().map(|c| Shape { id: 0, coast: c, frame: Default::default(), water: false }).collect();
+        let shapes = coast.into_iter().map(|c| Shape { id: 0, coast: c, frame: Default::default(), kind: ShapeKind::Land }).collect();
         self.set_shapes(seed, shapes)
     }
 
@@ -244,6 +265,10 @@ impl Engine {
             .map(|mut s| {
                 for p in s.coast.params.iter_mut() {
                     *p = p.sanitized();
+                }
+                if let ShapeKind::Highland(h) = s.kind {
+                    let h = if h.is_finite() { h } else { 0.0 };
+                    s.kind = ShapeKind::Highland(h.clamp(crate::coast::MIN_HIGHLAND_M, crate::coast::MAX_HIGHLAND_M));
                 }
                 s
             })
@@ -281,8 +306,8 @@ impl Engine {
             let old_cache = old_caches[j].take().expect("each old shape is matched once");
             let new = &self.shapes[k];
 
-            if old.water != new.water {
-                // Land became water or the reverse: everything it reaches changes.
+            if old.kind != new.kind {
+                // Kind or highland height changed: everything it reaches changes.
                 tasks.push(Task::All(old_cache.rect));
                 if old.coast == new.coast && old.frame == new.frame {
                     caches.push(old_cache);
@@ -386,7 +411,7 @@ impl Engine {
 
     fn shade(&mut self, pixels: Rect) {
         let blend_km = self.smoothing * self.cell_km;
-        render::shade(&self.elevation, &self.shore, &mut self.rgba, self.width, self.height, self.cell_km, blend_km, pixels);
+        render::shade(&self.elevation, &self.shore, &self.surface, &mut self.rgba, self.width, self.height, self.cell_km, blend_km, pixels);
     }
 
     fn compute_base(&mut self) {
@@ -573,16 +598,17 @@ impl Engine {
                     }
                 }
                 let idx = (cy * self.width + cx) as usize;
-                // Start from open ocean, then apply each shape in order: land
-                // keeps whichever reaches furthest inland, water cuts into it.
+                // Start from open ocean, then apply each land and water shape
+                // in order: land keeps whichever reaches furthest inland,
+                // water cuts into it. Highlands add up separately.
                 let mut level = -CLAMP_KM;
                 let mut level_params = far;
-                let mut any = false;
+                let mut lake = false; // the water here belongs to a water shape
+                let mut rise = 0.0f32;
                 for (shape, cache) in self.shapes.iter().zip(&self.caches) {
                     if !cache.rect.contains(cx, cy) {
                         continue;
                     }
-                    any = true;
                     let c = cache.index(cx, cy);
                     let d = cache.dist[c];
                     let signed = if cache.inside[c] { d } else { -d };
@@ -596,21 +622,36 @@ impl Engine {
                         // Too far from any segment for its parameters to matter.
                         (signed, far)
                     };
-                    if shape.water {
-                        if -shifted < level {
-                            level = -shifted;
-                            level_params = params;
+                    match shape.kind {
+                        ShapeKind::Land => {
+                            if shifted > level {
+                                level = shifted;
+                                level_params = params;
+                                lake = false;
+                            }
                         }
-                    } else if shifted > level {
-                        level = shifted;
-                        level_params = params;
+                        ShapeKind::Water => {
+                            if -shifted < level {
+                                level = -shifted;
+                                level_params = params;
+                                lake = true;
+                            }
+                        }
+                        ShapeKind::Highland(height) => rise += height * highland_rise(shifted, &params),
                     }
                 }
-                self.elevation[idx] = if any {
-                    elevation_from_coast(self.base[idx], level, &level_params)
+                // Highlands raise the ground, and with it any lake sitting in
+                // it; the ocean always stays at sea level.
+                let relative = elevation_from_coast(self.base[idx], level, &level_params);
+                let (elevation, surface) = if level >= 0.0 {
+                    (relative + rise, 0.0)
+                } else if lake {
+                    (rise + lake_depth(level, &level_params), rise)
                 } else {
-                    EMPTY_ELEVATION
+                    (relative, 0.0)
                 };
+                self.elevation[idx] = elevation;
+                self.surface[idx] = surface;
                 self.shore[idx] = level;
                 row_min = row_min.min(cx);
                 row_max = row_max.max(cx);

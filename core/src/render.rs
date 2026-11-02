@@ -45,7 +45,7 @@ fn tint(elevation: f32) -> [f32; 3] {
 /// zero, land and water colours are blended across that width around the
 /// coastline, which smooths the stair-stepped edge without supersampling.
 #[allow(clippy::too_many_arguments)]
-pub fn shade(elevation: &[f32], shore: &[f32], rgba: &mut [u8], width: u32, height: u32, cell_km: f32, blend_km: f32, r: Rect) {
+pub fn shade(elevation: &[f32], shore: &[f32], surface: &[f32], rgba: &mut [u8], width: u32, height: u32, cell_km: f32, blend_km: f32, r: Rect) {
     let cell_m = cell_km * 1000.0;
     // What each side of the coastline looks like right at the edge.
     let beach = tint(1.0);
@@ -57,24 +57,26 @@ pub fn shade(elevation: &[f32], shore: &[f32], rgba: &mut [u8], width: u32, heig
         let len = (x * x + y * y + z * z).sqrt();
         [x / len, y / len, z / len]
     };
+    // Height of what you'd see from above: the ground, or the water surface.
     let at = |x: i64, y: i64| -> f32 {
         let x = x.clamp(0, width as i64 - 1) as usize;
         let y = y.clamp(0, height as i64 - 1) as usize;
-        elevation[y * width as usize + x]
+        let i = y * width as usize + x;
+        if shore[i] < 0.0 { surface[i] } else { elevation[i] }
     };
 
     for cy in r.y0..r.y1 {
         for cx in r.x0..r.x1 {
             let (x, y) = (cx as i64, cy as i64);
-            let e = at(x, y);
-            let underwater = e < 0.0;
-            // Sea surface is flat: shade the seabed only faintly.
+            let i = cy as usize * width as usize + cx as usize;
+            let underwater = shore[i] < 0.0;
+            // Water surfaces are flat: no shading.
             let (sx, sy) = if underwater {
                 (0.0, 0.0)
             } else {
                 (
-                    (at(x + 1, y).max(0.0) - at(x - 1, y).max(0.0)) / (2.0 * cell_m) * EXAGGERATION,
-                    (at(x, y + 1).max(0.0) - at(x, y - 1).max(0.0)) / (2.0 * cell_m) * EXAGGERATION,
+                    (at(x + 1, y) - at(x - 1, y)) / (2.0 * cell_m) * EXAGGERATION,
+                    (at(x, y + 1) - at(x, y - 1)) / (2.0 * cell_m) * EXAGGERATION,
                 )
             };
             let len = (sx * sx + sy * sy + 1.0).sqrt();
@@ -83,10 +85,26 @@ pub fn shade(elevation: &[f32], shore: &[f32], rgba: &mut [u8], width: u32, heig
             let strength = if underwater { 0.0 } else { 0.65 };
             let factor = 1.0 + (relative - 1.0) * strength;
 
-            let mut c = tint(e);
+            // Water is coloured by depth below its surface; land by height,
+            // never as water even below sea level (a basin is still land).
+            let mut c = if underwater {
+                tint((elevation[i] - surface[i]).min(-0.5))
+            } else if elevation[i] < 0.0 {
+                // Land below sea level (a basin): low ground, a little darker
+                // the deeper it lies, so it never reads as beach or water.
+                let k = 1.0 - (-elevation[i] / 2000.0).min(0.35);
+                let g = tint(60.0);
+                [g[0] * k, g[1] * k, g[2] * k]
+            } else if shore[i] > 3.0 {
+                // Beach colours belong next to water only, not wherever
+                // inland ground happens to be near sea level.
+                tint(elevation[i].max(25.0))
+            } else {
+                tint(elevation[i].max(0.5))
+            };
             if blend_km > 0.0 {
                 // How much of this pixel lies on land, from its distance to the coast.
-                let d = shore[cy as usize * width as usize + cx as usize];
+                let d = shore[i];
                 let land = (0.5 + d / blend_km).clamp(0.0, 1.0);
                 let (other, amount) = if underwater { (beach, land) } else { (shallows, 1.0 - land) };
                 if amount > 0.0 {
@@ -95,7 +113,7 @@ pub fn shade(elevation: &[f32], shore: &[f32], rgba: &mut [u8], width: u32, heig
                     }
                 }
             }
-            let i = (cy as usize * width as usize + cx as usize) * 4;
+            let i = i * 4;
             rgba[i] = (c[0] * factor).clamp(0.0, 255.0) as u8;
             rgba[i + 1] = (c[1] * factor).clamp(0.0, 255.0) as u8;
             rgba[i + 2] = (c[2] * factor).clamp(0.0, 255.0) as u8;

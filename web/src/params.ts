@@ -34,8 +34,8 @@ export const SLIDERS: SliderSpec[] = [
   { key: "coves", label: "Coves and bays", hint: "A smooth coast at 0, many inlets and headlands at 100.", min: 0, max: 100, step: 1, format: (v) => `${Math.round(v)}%` },
   {
     key: "shore",
-    label: "Shore slope",
-    hint: "How far inland the land takes to rise. Short makes cliffs, long makes gentle beaches.",
+    label: "Slope",
+    hint: "How far the land takes to rise, from water or from lower land. Short makes cliffs and escarpments, long makes gentle slopes.",
     min: 0,
     max: 1000,
     step: 1,

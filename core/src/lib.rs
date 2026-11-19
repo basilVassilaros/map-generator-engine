@@ -5,11 +5,17 @@
 
 pub mod coast;
 pub mod engine;
+pub mod features;
+pub mod fine;
+pub mod hydro;
+pub mod look;
 pub mod noise;
+pub mod plan;
 pub mod render;
 
 #[cfg(target_arch = "wasm32")]
 mod ffi;
 
-pub use coast::{Coastline, Frame, SegmentParams, Shape, ShapeKind};
+pub use coast::{Coastline, Frame, SegmentParams, Shape, ShapeKind, AUTO_LEVEL};
+pub use features::{Mountain, River};
 pub use engine::{Engine, Rect};

@@ -56,7 +56,7 @@ impl SegmentParams {
         }
     }
 
-    fn lerp(a: Self, b: Self, t: f32) -> Self {
+    pub fn lerp(a: Self, b: Self, t: f32) -> Self {
         Self {
             roughness: a.roughness + (b.roughness - a.roughness) * t,
             coves: a.coves + (b.coves - a.coves) * t,
@@ -130,21 +130,21 @@ impl Frame {
 }
 
 /// What a shape does to the map.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeKind {
-    /// Adds land.
+    /// Land with its surface at the shape's height. Land drawn over land
+    /// steps up or down to its own height, with an escarpment at the edge.
     Land,
-    /// Cuts water (a lake, sea or bay) out of land. Its surface sits at the
-    /// level of the ground around it, so a lake on a plateau stays up there.
+    /// A lake, sea or bay cut out of land, its surface at the shape's height
+    /// (or at the level of the ground around it, with `AUTO_LEVEL`).
     Water,
-    /// Raises the land inside it by this many metres (negative lowers it),
-    /// with an escarpment around the edge. Only affects land.
-    Highland(f32),
 }
 
-/// Highland heights are limited to this range (metres).
-pub const MIN_HIGHLAND_M: f32 = -2000.0;
-pub const MAX_HIGHLAND_M: f32 = 4000.0;
+/// A water shape's height when its surface should follow the ground around it.
+pub const AUTO_LEVEL: f32 = f32::NEG_INFINITY;
+/// Shape heights are limited to this range (metres).
+pub const MIN_HEIGHT_M: f32 = -2000.0;
+pub const MAX_HEIGHT_M: f32 = 6000.0;
 
 /// One closed outline drawn by the user, with its own identity and frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -154,15 +154,12 @@ pub struct Shape {
     pub coast: Coastline,
     pub frame: Frame,
     pub kind: ShapeKind,
+    /// Land: height of its surface (m). Water: height of the water surface,
+    /// or `AUTO_LEVEL`.
+    pub height: f32,
 }
 
-impl Shape {
-    pub fn is_highland(&self) -> bool {
-        matches!(self.kind, ShapeKind::Highland(_))
-    }
-}
-
-/// How far up a highland's edge a cell is: 0 outside, rising to 1 over
+/// How far up a land shape's edge a cell is: 0 outside, rising to 1 over
 /// 3x the edge slope distance (`shore_km`), so a short slope is a cliff and a
 /// long one a gentle ramp. Flat beyond INFLUENCE_KM, like the coast profile.
 pub fn highland_rise(signed_km: f32, p: &SegmentParams) -> f32 {
@@ -323,6 +320,20 @@ pub fn lake_depth(signed_km: f32, p: &SegmentParams) -> f32 {
     let out = (-signed_km).max(0.0);
     let shelf_width = 2.0 * p.shore_km + 8.0;
     -(15.0 + 285.0 * smoothstep(0.0, shelf_width.max(40.0), out))
+}
+
+/// How far land has risen from a shoreline `signed_km` away: 0 at the water's
+/// edge, 1 once 3x the slope distance inland. A short slope is a cliff.
+pub fn coast_rise(signed_km: f32, p: &SegmentParams) -> f32 {
+    let s = (signed_km.max(0.0) / (3.0 * p.shore_km)).min(1.0);
+    1.0 - (1.0 - s) * (1.0 - s)
+}
+
+/// Depth of the open ocean (metres, negative), `signed_km` from the coast.
+pub fn ocean_depth(signed_km: f32, p: &SegmentParams) -> f32 {
+    let out = (-signed_km).max(0.0);
+    let shelf_width = 2.0 * p.shore_km + 8.0;
+    -(15.0 + 165.0 * smoothstep(0.0, shelf_width, out) + 3500.0 * smoothstep(50.0, INFLUENCE_KM, out))
 }
 
 /// Gently varying lowland height, independent of the coastline.

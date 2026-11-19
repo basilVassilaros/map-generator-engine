@@ -113,7 +113,8 @@ fn window_lines_up_with_the_whole_map() {
 
 // --- multiple shapes ----------------------------------------------------------
 
-use terrain_core::{Frame, Shape, ShapeKind};
+use terrain_core::engine::{FLOODED, LAND, RIVER};
+use terrain_core::{Frame, Mountain, River, Shape, ShapeKind, AUTO_LEVEL};
 
 fn island(id: u32, cx: f32, cy: f32, r: f32, seed: u32) -> Shape {
     let points: Vec<[f32; 2]> = (0..7)
@@ -123,7 +124,7 @@ fn island(id: u32, cx: f32, cy: f32, r: f32, seed: u32) -> Shape {
         })
         .collect();
     let params = points.iter().map(|_| SegmentParams::default()).collect();
-    Shape { id, coast: Coastline { points, params, seed }, frame: Frame { x: cx, y: cy, angle: 0.0, scale: 1.0 }, kind: ShapeKind::Land }
+    Shape { id, coast: Coastline { points, params, seed }, frame: Frame { x: cx, y: cy, angle: 0.0, scale: 1.0 }, kind: ShapeKind::Land, height: 300.0 }
 }
 
 fn world(shapes: &[Shape]) -> Engine {
@@ -216,7 +217,7 @@ fn moving_a_shape_keeps_its_coastline() {
 // --- fill in, and water shapes ----------------------------------------------
 
 fn lake(id: u32, cx: f32, cy: f32, r: f32, seed: u32) -> Shape {
-    Shape { kind: ShapeKind::Water, ..island(id, cx, cy, r, seed) }
+    Shape { kind: ShapeKind::Water, height: AUTO_LEVEL, ..island(id, cx, cy, r, seed) }
 }
 
 /// Signed distance to the coast at a world position: negative means water.
@@ -256,7 +257,7 @@ fn everything_drawn_as_land_is_land() {
         let shape = island(1, 800.0, 800.0, 400.0, seed);
         let e = world(&[shape.clone()]);
         for p in just_inside(&shape) {
-            assert!(at_km(&e, p[0], p[1]) > 0.0, "seed {seed}: sea inside the drawn shape at {p:?}");
+            assert!(shore_km(&e, p[0], p[1]) > 0.0, "seed {seed}: sea inside the drawn shape at {p:?}");
         }
     }
 }
@@ -339,7 +340,7 @@ fn inward_reach_can_cut_into_the_shape() {
         p.coves = 1.0;
     }
     let e = world(&[shape.clone()]);
-    let wet = just_inside(&shape).iter().filter(|p| at_km(&e, p[0], p[1]) < 0.0).count();
+    let wet = just_inside(&shape).iter().filter(|p| shore_km(&e, p[0], p[1]) < 0.0).count();
     assert!(wet > 0, "expected some sea inside the drawn line");
 }
 
@@ -391,10 +392,21 @@ fn scaled_shape_edits_match_full_regeneration() {
     assert_same(&live, &world(&shapes));
 }
 
-// --- highlands, escarpments and lakes on high ground ----------------------------
+// --- heights, escarpments, flooding, mountains and rivers -------------------------
 
-fn highland(id: u32, cx: f32, cy: f32, r: f32, seed: u32, height: f32, slope_km: f32) -> Shape {
-    let mut s = Shape { kind: ShapeKind::Highland(height), ..island(id, cx, cy, r, seed) };
+fn kind_at(e: &Engine, x: f32, y: f32) -> u8 {
+    let cell = EXTENT_KM / SIZE as f32;
+    e.water()[((y / cell) as u32 * SIZE + (x / cell) as u32) as usize]
+}
+
+fn surface_at(e: &Engine, x: f32, y: f32) -> f32 {
+    let cell = EXTENT_KM / SIZE as f32;
+    e.surface()[((y / cell) as u32 * SIZE + (x / cell) as u32) as usize]
+}
+
+/// A land shape with a height and an edge slope.
+fn land(id: u32, cx: f32, cy: f32, r: f32, seed: u32, height: f32, slope_km: f32) -> Shape {
+    let mut s = Shape { height, ..island(id, cx, cy, r, seed) };
     for p in s.coast.params.iter_mut() {
         p.shore_km = slope_km;
         p.reach_km = 10.0;
@@ -403,93 +415,224 @@ fn highland(id: u32, cx: f32, cy: f32, r: f32, seed: u32, height: f32, slope_km:
 }
 
 #[test]
-fn highland_raises_the_land_inside_it() {
-    let land = island(1, 800.0, 800.0, 600.0, 1);
-    let flat = world(&[land.clone()]);
-    let raised = world(&[land, highland(2, 800.0, 800.0, 250.0, 2, 1200.0, 4.0)]);
-    let inside = at_km(&raised, 800.0, 800.0) - at_km(&flat, 800.0, 800.0);
-    assert!((inside - 1200.0).abs() < 1.0, "raised by {inside} m");
-    let outside = at_km(&raised, 800.0, 1200.0) - at_km(&flat, 800.0, 1200.0);
-    assert!(outside.abs() < 1e-3, "outside the highland changed by {outside} m");
+fn land_height_sets_the_surface() {
+    let low = world(&[land(1, 800.0, 800.0, 600.0, 1, 200.0, 4.0)]);
+    let high = world(&[land(1, 800.0, 800.0, 600.0, 1, 1500.0, 4.0)]);
+    let (a, b) = (at_km(&low, 800.0, 800.0), at_km(&high, 800.0, 800.0));
+    assert!((a - 200.0).abs() < 130.0, "low land at {a} m");
+    assert!((b - 1500.0).abs() < 200.0, "high land at {b} m");
 }
 
 #[test]
-fn short_slope_is_a_cliff_and_long_slope_a_ramp() {
-    // Steepest rise between neighbouring cells across the escarpment.
+fn land_on_land_makes_an_escarpment() {
+    // The steepest step between neighbouring cells across the inner shape's edge.
     let steepest = |slope_km: f32| {
-        let land = island(1, 800.0, 800.0, 650.0, 1);
-        let e = world(&[land, highland(2, 800.0, 800.0, 300.0, 2, 1500.0, slope_km)]);
-        // Only across the escarpment: the island's own coast is ~650 km out,
-        // the escarpment ~300 km, so stay within 450 km of the centre.
+        let e = world(&[land(1, 800.0, 800.0, 650.0, 1, 300.0, 4.0), land(2, 800.0, 800.0, 300.0, 2, 1800.0, slope_km)]);
+        assert!(at_km(&e, 800.0, 800.0) > 1500.0, "the upper land is high");
+        assert!(at_km(&e, 800.0, 1220.0) < 700.0, "the lower land is not");
         let cell = EXTENT_KM / SIZE as f32;
         let (from, to) = (((800.0 - 450.0) / cell) as u32, ((800.0 + 450.0) / cell) as u32);
         let mut worst = 0.0f32;
         for x in from..to {
-            let i = (SIZE / 2) * SIZE + x;
-            worst = worst.max((e.elevation()[i as usize + 1] - e.elevation()[i as usize]).abs());
+            let i = ((SIZE / 2) * SIZE + x) as usize;
+            worst = worst.max((e.elevation()[i + 1] - e.elevation()[i]).abs());
         }
         worst
     };
-    let cliff = steepest(0.1);
-    let ramp = steepest(30.0);
+    let (cliff, ramp) = (steepest(0.1), steepest(30.0));
     assert!(cliff > 900.0, "cliff steepest step {cliff} m");
     assert!(ramp < 150.0, "ramp steepest step {ramp} m");
 }
 
 #[test]
-fn lake_on_a_plateau_stays_on_the_plateau() {
-    let shapes = vec![
-        island(1, 800.0, 800.0, 650.0, 1),
-        highland(2, 800.0, 800.0, 400.0, 2, 900.0, 5.0),
-        lake(3, 800.0, 800.0, 120.0, 3),
-    ];
+fn lower_land_on_land_steps_down() {
+    let e = world(&[land(1, 800.0, 800.0, 650.0, 1, 1200.0, 4.0), land(2, 800.0, 800.0, 250.0, 2, 300.0, 5.0)]);
+    assert!(at_km(&e, 800.0, 800.0) < 600.0 && at_km(&e, 800.0, 1200.0) > 900.0);
+}
+
+#[test]
+fn lake_takes_the_level_of_the_land_or_its_own() {
+    let shapes = vec![land(1, 800.0, 800.0, 650.0, 1, 900.0, 5.0), lake(2, 800.0, 800.0, 120.0, 3)];
+    let auto = world(&shapes);
+    assert_ne!(kind_at(&auto, 800.0, 800.0), LAND);
+    // Following the ground, it sits in a hollow a little below the land's 900 m...
+    let level = surface_at(&auto, 800.0, 800.0);
+    assert!(level > 700.0 && level < 900.0, "auto level {level}");
+    // ...and never floods the country around it.
+    let flooded = auto.water().iter().filter(|k| **k == FLOODED).count();
+    assert_eq!(flooded, 0, "a lake at ground level flooded {flooded} cells");
+    let mut set = shapes.clone();
+    set[1].height = 400.0;
+    let fixed = world(&set);
+    assert!((surface_at(&fixed, 800.0, 800.0) - 400.0).abs() < 1.0);
+}
+
+#[test]
+fn land_below_water_it_touches_floods() {
+    // A low patch reaching the coast floods; the same patch inland stays dry.
+    let continent = land(1, 800.0, 800.0, 600.0, 1, 400.0, 4.0);
+    let coastal = world(&[continent.clone(), land(2, 1250.0, 800.0, 160.0, 2, -300.0, 8.0)]);
+    assert_eq!(kind_at(&coastal, 1250.0, 800.0), FLOODED, "low land open to the sea floods");
+    assert_eq!(surface_at(&coastal, 1250.0, 800.0), 0.0, "to sea level");
+
+    let inland = world(&[continent, land(2, 800.0, 800.0, 160.0, 2, -300.0, 8.0)]);
+    assert_eq!(kind_at(&inland, 800.0, 800.0), LAND, "a basin no water reaches stays dry");
+    assert!(at_km(&inland, 800.0, 800.0) < 0.0, "though it lies below sea level");
+}
+
+#[test]
+fn land_below_a_lake_it_touches_floods_to_the_lake_level() {
+    let mut water = lake(3, 800.0, 800.0, 100.0, 3);
+    water.height = 500.0;
+    let shapes = vec![land(1, 800.0, 800.0, 650.0, 1, 600.0, 4.0), land(2, 980.0, 800.0, 110.0, 2, 350.0, 6.0), water];
     let e = world(&shapes);
+    assert_eq!(kind_at(&e, 1000.0, 800.0), FLOODED);
+    assert!((surface_at(&e, 1000.0, 800.0) - 500.0).abs() < 1.0);
+}
+
+fn peak(id: u32, points: Vec<[f32; 2]>, height: f32, width_km: f32) -> Mountain {
+    Mountain { id, seed: id * 7 + 1, points, height, width_km, rugged: 0.6, ..Default::default() }
+}
+
+fn with_features(shapes: &[Shape], mountains: &[Mountain], rivers: &[River]) -> Engine {
+    let mut e = Engine::new(SIZE, SIZE, EXTENT_KM);
+    e.set_guides(99, shapes.to_vec(), mountains.to_vec(), rivers.to_vec());
+    e
+}
+
+#[test]
+fn mountains_raise_the_ground_along_their_line() {
+    let shapes = [land(1, 800.0, 800.0, 650.0, 1, 300.0, 4.0)];
+    let flat = with_features(&shapes, &[], &[]);
+    let range = peak(1, vec![[500.0, 800.0], [1100.0, 800.0]], 3000.0, 60.0);
+    let e = with_features(&shapes, &[range], &[]);
+    // Highest point along a line across the range, and a point well clear of it.
     let cell = EXTENT_KM / SIZE as f32;
-    let i = ((800.0 / cell) as u32 * SIZE + (800.0 / cell) as u32) as usize;
-    assert!(e.shore()[i] < 0.0, "the lake is water");
-    assert!((e.surface()[i] - 900.0).abs() < 1.0, "lake surface {} m", e.surface()[i]);
-    assert!(e.elevation()[i] < e.surface()[i], "lake bed below its surface");
-    assert!(e.elevation()[i] > 0.0, "and still far above sea level");
+    let crest = (0..80).map(|k| at_km(&e, 800.0, 760.0 + k as f32 * cell)).fold(0.0f32, f32::max);
+    assert!(crest > 1700.0, "crest {crest} m");
+    assert_eq!(at_km(&e, 800.0, 1100.0), at_km(&flat, 800.0, 1100.0), "ground beyond its slopes is untouched");
 }
 
 #[test]
-fn highland_crossing_the_coast_makes_sea_cliffs_not_land() {
-    // A highland hanging off the edge of an island: the sea stays sea.
-    let shapes = vec![island(1, 700.0, 800.0, 400.0, 1), highland(2, 1100.0, 800.0, 250.0, 2, 800.0, 2.0)];
-    let e = world(&shapes);
-    assert!(shore_km(&e, 1300.0, 800.0) < 0.0, "sea beyond the island");
+fn a_mountain_in_the_sea_is_an_island() {
+    let e = with_features(&[], &[peak(1, vec![[800.0, 800.0]], 2500.0, 40.0)], &[]);
+    assert_eq!(kind_at(&e, 800.0, 800.0), LAND);
+    assert!(at_km(&e, 800.0, 800.0) > 500.0);
+    assert_ne!(kind_at(&e, 1000.0, 800.0), LAND, "open sea away from it");
+}
+
+#[test]
+fn rivers_run_downhill_and_cut_through_rises() {
+    // A river crossing a mountain range on its way to the coast.
+    let shapes = [land(1, 800.0, 800.0, 650.0, 1, 500.0, 6.0)];
+    let range = peak(1, vec![[800.0, 500.0], [800.0, 1100.0]], 2000.0, 50.0);
+    let river = River { id: 1, points: vec![[600.0, 800.0], [1000.0, 820.0], [1500.0, 800.0]], width_km: 4.0, depth_m: 30.0, ..Default::default() };
+    let e = with_features(&shapes, &[range], &[river.clone()]);
     let cell = EXTENT_KM / SIZE as f32;
-    let i = ((800.0 / cell) as u32 * SIZE + (1300.0 / cell) as u32) as usize;
-    assert_eq!(e.surface()[i], 0.0, "the sea is at sea level");
-    assert!(at_km(&e, 1000.0, 800.0) > 700.0, "the island's raised part");
+    let mut last = f32::MAX;
+    let mut wet = 0;
+    for k in 0..200 {
+        let x = 600.0 + k as f32 * cell;
+        if x > 1350.0 {
+            break;
+        }
+        let y = 800.0 + (x - 600.0) / 400.0 * 20.0_f32.min(20.0);
+        if kind_at(&e, x, y.min(820.0)) == RIVER {
+            let s = surface_at(&e, x, y.min(820.0));
+            assert!(s <= last + 0.01, "river rises from {last} to {s} at x = {x}");
+            last = s;
+            wet += 1;
+        }
+    }
+    assert!(wet > 30, "only {wet} river cells found");
 }
 
 #[test]
-fn negative_highland_is_a_basin_and_stays_land() {
-    let shapes = vec![island(1, 800.0, 800.0, 600.0, 1), highland(2, 800.0, 800.0, 200.0, 2, -900.0, 20.0)];
-    let e = world(&shapes);
-    assert!(at_km(&e, 800.0, 800.0) < 0.0, "below sea level");
-    assert!(shore_km(&e, 800.0, 800.0) > 0.0, "but still land, not sea");
+fn edits_with_mountains_and_rivers_match_full_regeneration() {
+    let mut shapes = vec![land(1, 800.0, 800.0, 650.0, 1, 400.0, 4.0), land(2, 700.0, 700.0, 250.0, 2, 1400.0, 3.0), lake(3, 950.0, 950.0, 90.0, 3)];
+    let mut mountains = vec![peak(1, vec![[500.0, 900.0], [900.0, 1100.0]], 2500.0, 55.0)];
+    let mut rivers = vec![River { id: 1, points: vec![[700.0, 700.0], [1000.0, 1300.0]], width_km: 3.0, depth_m: 25.0, ..Default::default() }];
+    let mut live = with_features(&shapes, &mountains, &rivers);
+
+    shapes[1].height = 2200.0; // a shape's height
+    live.set_guides(99, shapes.clone(), mountains.clone(), rivers.clone());
+    assert_same(&live, &with_features(&shapes, &mountains, &rivers));
+
+    mountains[0].points[1] = [950.0, 1000.0]; // drag a mountain point
+    mountains[0].height = 3200.0;
+    live.set_guides(99, shapes.clone(), mountains.clone(), rivers.clone());
+    assert_same(&live, &with_features(&shapes, &mountains, &rivers));
+
+    rivers[0].points[1] = [1200.0, 1250.0]; // move the river's mouth
+    live.set_guides(99, shapes.clone(), mountains.clone(), rivers.clone());
+    assert_same(&live, &with_features(&shapes, &mountains, &rivers));
+
+    shapes.push(land(4, 1250.0, 800.0, 150.0, 4, -200.0, 8.0)); // low coast: floods
+    live.set_guides(99, shapes.clone(), mountains.clone(), rivers.clone());
+    assert_same(&live, &with_features(&shapes, &mountains, &rivers));
+
+    mountains.clear(); // remove the mountains and the river
+    rivers.clear();
+    live.set_guides(99, shapes.clone(), mountains.clone(), rivers.clone());
+    assert_same(&live, &with_features(&shapes, &mountains, &rivers));
 }
 
 #[test]
-fn highland_edits_match_full_regeneration() {
-    let mut shapes = vec![
-        island(1, 800.0, 800.0, 650.0, 1),
-        highland(2, 750.0, 750.0, 350.0, 2, 900.0, 3.0),
-        lake(3, 700.0, 700.0, 100.0, 3),
-    ];
-    let mut live = world(&shapes);
-    shapes[1].kind = ShapeKind::Highland(1500.0); // height
-    live.set_shapes(99, shapes.clone());
-    assert_same(&live, &world(&shapes));
-    shapes[1].coast.params[3].shore_km = 25.0; // edge slope on one segment
-    live.set_shapes(99, shapes.clone());
-    assert_same(&live, &world(&shapes));
-    shapes[1].coast.points[2][0] += 40.0; // drag an escarpment point
-    live.set_shapes(99, shapes.clone());
-    assert_same(&live, &world(&shapes));
-    shapes.remove(1); // remove the highland: the lake drops back to sea level
-    live.set_shapes(99, shapes.clone());
-    assert_same(&live, &world(&shapes));
+fn curved_rivers_still_run_downhill_and_edits_match_full_regeneration() {
+    let shapes = [land(1, 800.0, 800.0, 650.0, 1, 500.0, 6.0)];
+    let range = Mountain { curviness: 0.8, ..peak(1, vec![[800.0, 450.0], [700.0, 800.0], [820.0, 1150.0]], 2000.0, 50.0) };
+    let mut river = River { id: 1, points: vec![[550.0, 700.0], [900.0, 950.0], [1250.0, 800.0], [1500.0, 900.0]], width_km: 4.0, depth_m: 30.0, curviness: 1.0, ..Default::default() };
+    let e = with_features(&shapes, &[range.clone()], &[river.clone()]);
+    // Walk every river cell in order along the curve: the surface never rises.
+    let path = terrain_core::features::curve_path(&river.points, river.curviness, &river.bends);
+    let cell = EXTENT_KM / SIZE as f32;
+    let mut last = f32::MAX;
+    let mut wet = 0;
+    for w in path.windows(2) {
+        let steps = (((w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])) / cell).ceil() as usize;
+        for k in 0..steps.max(1) {
+            let t = k as f32 / steps.max(1) as f32;
+            let (x, y) = (w[0][0] + (w[1][0] - w[0][0]) * t, w[0][1] + (w[1][1] - w[0][1]) * t);
+            if x > 1350.0 { continue; }
+            if kind_at(&e, x, y) == RIVER {
+                let s = surface_at(&e, x, y);
+                assert!(s <= last + 0.01, "curved river rises from {last} to {s}");
+                last = s;
+                wet += 1;
+            }
+        }
+    }
+    assert!(wet > 40, "only {wet} river cells on the curve");
+
+    let mut live = with_features(&shapes, &[range.clone()], &[river.clone()]);
+    river.curviness = 0.3; // the slider
+    live.set_guides(99, shapes.to_vec(), vec![range.clone()], vec![river.clone()]);
+    assert_same(&live, &with_features(&shapes, &[range.clone()], &[river.clone()]));
+    river.bends = vec![0.0, 40.0, 0.0]; // bow the middle segment
+    let bowed = Mountain { bends: vec![-30.0, 0.0], ..range };
+    live.set_guides(99, shapes.to_vec(), vec![bowed.clone()], vec![river.clone()]);
+    assert_same(&live, &with_features(&shapes, &[bowed], &[river]));
+}
+
+#[test]
+fn overlapping_land_with_different_slopes_has_no_cliff_where_they_meet() {
+    // Two overlapping land shapes of the same height but very different shore
+    // slopes. Inland, the steepest step between neighbouring cells must be no
+    // worse than the gentle ramp of the shallower coast alone: there must be no
+    // cliff along the line where one shape's coast takes over from the other's.
+    let steepest = |slope_a: f32| {
+        let e = world(&[land(1, 700.0, 800.0, 450.0, 1, 600.0, slope_a), land(2, 1000.0, 800.0, 450.0, 2, 600.0, 25.0)]);
+        let mut worst = 0.0f32;
+        for y in (SIZE / 4)..(3 * SIZE / 4) {
+            for x in (SIZE / 6)..(5 * SIZE / 6) {
+                let i = (y * SIZE + x) as usize;
+                if e.shore()[i] > 25.0 && e.shore()[i + 1] > 25.0 {
+                    worst = worst.max((e.elevation()[i + 1] - e.elevation()[i]).abs());
+                }
+            }
+        }
+        worst
+    };
+    let (alike, mixed) = (steepest(25.0), steepest(2.0));
+    assert!(mixed < alike * 1.6 + 10.0, "mixed slopes: a {mixed} m step, against {alike} m when alike");
 }

@@ -19,12 +19,12 @@ export interface FullExportProgress {
   remainingMs: number | null;
 }
 
-interface Runner {
+export interface Runner {
   run(msg: ToCore, transfer: Transferable[]): Promise<FromCore>;
   stop(): void;
 }
 
-function workerRunner(): Runner | null {
+export function workerRunner(): Runner | null {
   try {
     const url = URL.createObjectURL(new Blob([WORKER_SOURCE], { type: "text/javascript" }));
     const worker = new Worker(url);
@@ -44,7 +44,7 @@ function workerRunner(): Runner | null {
   }
 }
 
-function mainThreadRunner(): Runner {
+export function mainThreadRunner(): Runner {
   const host = new CoreHost();
   return { run: (msg) => host.handle(msg), stop: () => {} };
 }

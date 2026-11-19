@@ -235,7 +235,7 @@ px = d.execute_script("""
 check("the inside of the lake is water", px[2] > px[0] + 30, f"pixel {px}")
 shot("06b-lake")
 
-# A highland inside shape A raises the ground: the map turns from lowland
+# Land drawn on land steps up to its own height: the map turns from lowland
 # green towards upland brown there.
 def map_pixel(x_km, y_km):
     return d.execute_script("""
@@ -249,23 +249,65 @@ d.find_element(By.ID, "new-shape").click(); time.sleep(0.2)
 HIGH = [(270,330),(400,320),(390,420),(280,430)]
 for p in HIGH: click_km(*p)
 click_km(*HIGH[0]); wait_frames()
-d.find_element(By.ID, "kind-highland").click(); wait_frames()
-check("a shape can become a highland", "Highland" in text("shape-list") and not hidden("height-field"), text("height-value"))
-set_slider("height", 2000); wait_frames()
+check("land has a height slider and no separate highland kind", not hidden("height-field") and not d.find_elements(By.ID, "kind-highland"), text("height-value"))
+set_slider("height", 2500); wait_frames()
 high = map_pixel(330, 375)
-check("raising a highland changes the ground inside it", high != low and high[0] - high[1] > low[0] - low[1], f"{low} -> {high}")
-check("highland edge slope is labelled for escarpments", "Edge slope" in d.find_element(By.ID, "shape-sliders").text)
-shot("06c-highland")
+check("land on land steps up to its own height", high != low and high[0] - high[1] > low[0] - low[1], f"{low} -> {high}")
+check("the slope slider covers coasts and escarpments", "Slope" in d.find_element(By.ID, "shape-sliders").text)
+shot("06c-escarpment")
+
+# Mountains: a range from two points, finished with Enter.
+before = map_pixel(600, 700)
+d.find_element(By.ID, "tool-mountain").click(); time.sleep(0.2)
+click_km(560, 690); click_km(660, 720)
+overlay.send_keys(Keys.ENTER) if False else ActionChains(d).send_keys(Keys.ENTER).perform()
+wait_frames()
+check("a mountain range can be drawn", "Range 1" in text("shape-list") and not hidden("feature-panel"), text("feature-title"))
+check("mountains raise the ground", map_pixel(610, 705) != before, f"{before} -> {map_pixel(610, 705)}")
+
+# Rivers: three points downstream to the coast.
+d.find_element(By.ID, "tool-river").click(); time.sleep(0.2)
+click_km(450, 650); click_km(380, 700); click_km(200, 720)
+ActionChains(d).send_keys(Keys.ENTER).perform(); wait_frames()
+check("a river can be drawn", "River 1" in text("shape-list"), text("feature-title"))
+px = map_pixel(400, 686)
+check("the river shows as water", px[2] > px[0] + 20, f"pixel {px}")
+# Curves: a river drawn through three points forms a "<"; Curviness turns it into a "(".
+d.find_element(By.ID, "tool-river").click(); time.sleep(0.2)
+click_km(1250, 700); click_km(1120, 820); click_km(1250, 940)
+ActionChains(d).send_keys(Keys.ENTER).perform(); wait_frames()
+check("a river has a Curviness slider", not hidden("feature-panel") and not hidden("f-curve-field"), text("f-curve-value"))
+set_slider("f-curve", 0); wait_frames(1.5)
+straight = d.execute_script("return document.getElementById('overlay').toDataURL().length")
+set_slider("f-curve", 100); wait_frames(1.5)
+curved = d.execute_script("return document.getElementById('overlay').toDataURL().length")
+check("Curviness redraws the river as a curve", straight != curved and text("f-curve-value") == "100%", f"{text('f-curve-value')}")
+# Drag the bend handle of the first segment sideways: the segment bows.
+ox, oy = km_to_offset(1185, 760)
+before = d.execute_script("return document.getElementById('overlay').toDataURL().length")
+mouse().move_to_element_with_offset(overlay, ox, oy).click_and_hold().move_by_offset(-30, 10).move_by_offset(-10, 4).release().perform(); wait_frames(1.5)
+after = d.execute_script("return document.getElementById('overlay').toDataURL().length")
+check("dragging a bend handle bows a segment", before != after and not d.find_element(By.ID, "f-reset-bends").get_property("disabled"))
+d.find_element(By.ID, "f-reset-bends").click(); wait_frames(1)
+check("Straighten bows clears them", d.find_element(By.ID, "f-reset-bends").get_property("disabled"))
+shot("06d-mountains-rivers")
+d.find_element(By.ID, "tool-coast").click(); time.sleep(0.2)
+
+# A new variation changes the noise but keeps the design.
+before = d.execute_script("return document.getElementById('map').toDataURL().length")
+d.find_element(By.ID, "generate").click(); wait_frames(3)
+after = d.execute_script("return document.getElementById('map').toDataURL().length")
+check("New variation regenerates with different noise", before != after and len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) >= 5, d.find_element(By.ID, "generate").text)
 
 # Lock shape A, then clicking its fill must not select it.
 lock_btn = d.find_elements(By.CSS_SELECTOR, ".shape-row")[0].find_elements(By.CSS_SELECTOR, ".icon-btn")[1]
 lock_btn.click(); time.sleep(0.2)
 click_km(900, 900)  # empty sea, deselect
-click_km(300, 640)  # inside shape A, outside the lake and highland
+click_km(300, 560)  # inside shape A, clear of the lake, upland, range and river
 check("locked shape can't be selected on the map", hidden("shape-panel") and hidden("segment-panel"))
 lock_btn = d.find_elements(By.CSS_SELECTOR, ".shape-row")[0].find_elements(By.CSS_SELECTOR, ".icon-btn")[1]
 lock_btn.click(); time.sleep(0.2)
-click_km(300, 640)
+click_km(300, 560)
 check("unlocked shape selects by clicking its fill", not hidden("shape-panel"))
 
 # Rename.
@@ -341,7 +383,7 @@ check("a selected reference image can be dragged", before != after)
 rows = d.find_elements(By.CSS_SELECTOR, ".shape-row")
 rows[-1].find_elements(By.CSS_SELECTOR, ".icon-btn")[1].click(); time.sleep(0.3)
 check("reference image can be locked", "Locked" in text("reference-help"), text("reference-help"))
-click_km(300, 640)
+click_km(300, 560)
 check("clicks pass through a locked reference to the shapes", not hidden("shape-panel"))
 shot("09a-reference")
 
@@ -357,10 +399,190 @@ def set_width(km, choice):
 set_width(800, "width-scale")
 check("map width changes", "800 km across" in text("map-facts"), text("map-facts"))
 check("resolution labels follow the map width", "781 m per pixel" in d.find_element(By.ID, "resolution").text, d.find_element(By.ID, "resolution").text.split("\n")[1])
-check("shapes survive a map width change", len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) >= 4)
+check("shapes survive a map width change", len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) >= 6)
 shot("09b-map-800km")
 set_width(1600, "width-scale")
 check("map width restores", "1,600 km across" in text("map-facts"), text("map-facts"))
+
+# Terrain render: notice first, then the rendered map. (Hide the reference
+# picture and deselect, so the screenshot shows the render itself.)
+[r for r in d.find_elements(By.CSS_SELECTOR, ".shape-row.reference")][0].find_elements(By.CSS_SELECTOR, ".icon-btn")[0].click(); time.sleep(0.2)
+ActionChains(d).send_keys(Keys.ESCAPE).perform(); time.sleep(0.2)
+d.find_element(By.ID, "render-terrain").click(); time.sleep(0.4)
+check("terrain render explains itself first", d.execute_script("return document.getElementById('terrain-dialog').open"))
+d.find_element(By.ID, "terrain-skip").click()
+d.find_element(By.ID, "terrain-go").click()
+for _ in range(80):
+    time.sleep(0.5)
+    if "Terrain rendered" in text("export-status"): break
+check("terrain renders with rivers", "Terrain rendered" in text("export-status") and "rivers" in text("export-status"), text("export-status"))
+check("the terrain render offers to save its image", not hidden("save-terrain"))
+from selenium.webdriver.support.ui import Select as _Select
+_Select(d.find_element(By.ID, "terrain-look")).select_by_value("1"); time.sleep(0.2)
+_Select(d.find_element(By.ID, "terrain-detail")).select_by_value("map-2048"); time.sleep(0.2)
+d.find_element(By.ID, "render-terrain").click()
+t_hq = time.time()
+for _ in range(300):
+    time.sleep(0.5)
+    if "rendered in detail" in text("export-status") or "failed" in text("export-status"): break
+check("a whole-map detail render completes at 2048 px", "rendered in detail" in text("export-status") and "2048 × 2048" in text("export-status"), f"{text('export-status')[:140]} ({time.time()-t_hq:.0f} s)")
+tl = d.execute_script("""const c=document.getElementById('map'); const g=c.getContext('2d'); const w=c.width,h=c.height; const px=g.getImageData(Math.floor(w*0.5),Math.floor(h*0.5),1,1).data; return [px[0],px[1],px[2]];""")
+check("the detail render is drawn on the map", sum(tl) > 60, f"centre pixel {tl}")
+shot("09c2-terrain-detail")
+d.find_element(By.ID, "zoom-in").click(); d.find_element(By.ID, "zoom-in").click(); d.find_element(By.ID, "zoom-in").click(); time.sleep(1.2)
+check("a detail render can be zoomed", text("zoom-level") != "1.0×", text("zoom-level"))
+shot("09c3-terrain-zoomed")
+d.find_element(By.ID, "zoom-fit").click(); time.sleep(0.5)
+d.find_element(By.ID, "save-terrain").click(); time.sleep(6)
+saved_png = glob.glob(os.path.join(DOWNLOADS, "terrain-2048x2048.png"))
+check("the detail render saves as a 2048 px PNG", len(saved_png) == 1, ", ".join(os.path.basename(f) for f in glob.glob(os.path.join(DOWNLOADS, "terrain-*.png"))))
+# "This view only": zoom in and render just what is on screen, much finer.
+d.find_element(By.ID, "zoom-in").click(); d.find_element(By.ID, "zoom-in").click(); time.sleep(0.8)
+_Select(d.find_element(By.ID, "terrain-detail")).select_by_value("view-2048"); time.sleep(0.2)
+d.find_element(By.ID, "render-terrain").click()
+t_view = time.time()
+for _ in range(300):
+    time.sleep(0.5)
+    if "rendered in detail" in text("export-status") or "failed" in text("export-status"): break
+import re as _re
+m = _re.search(r"(\d+) m per pixel", text("export-status"))
+check("a view-only detail render is much finer than the whole map", bool(m) and int(m.group(1)) < 300, f"{m.group(0) if m else text('export-status')[:100]} ({time.time()-t_view:.0f} s)")
+shot("09c4-terrain-view")
+d.find_element(By.ID, "zoom-fit").click(); time.sleep(0.5)
+_Select(d.find_element(By.ID, "terrain-detail")).select_by_value("quick"); time.sleep(0.2)
+shot("09c-terrain")
+d.find_element(By.ID, "render-terrain").click(); time.sleep(0.5)
+check("the notice stays hidden once dismissed", not d.execute_script("return document.getElementById('terrain-dialog').open"))
+for _ in range(80):
+    time.sleep(0.5)
+    if "Terrain rendered" in text("export-status"): break
+
+# Planned features: the render works out rivers, hills and lakes as vectors.
+check("the terrain render shows what it planned", not hidden("planned-box") and "rivers" in text("planned-facts"), text("planned-facts"))
+o1 = d.execute_script("return document.getElementById('overlay').toDataURL().length")
+d.find_element(By.ID, "show-planned").click(); time.sleep(0.3)
+o2 = d.execute_script("return document.getElementById('overlay').toDataURL().length")
+d.find_element(By.ID, "show-planned").click(); time.sleep(0.3)
+check("planned rivers, hills and lakes can be shown or hidden", o1 != o2)
+shot("10a-planned")
+
+# Terrain exports at full detail: the colour image and a 16-bit heightmap.
+for f in glob.glob(os.path.join(DOWNLOADS, "terrain-*.png")): os.remove(f)
+def open_export(mode):
+    d.find_element(By.ID, "export").click(); time.sleep(0.3)
+    d.find_element(By.CSS_SELECTOR, f'input[name="export-mode"][value="{mode}"]').click(); time.sleep(0.3)
+d.find_element(By.ID, "export").click(); time.sleep(0.3)
+check("terrain exports are offered once the terrain is rendered", d.execute_script("return !document.querySelector('input[name=\"export-mode\"][value=\"terrain\"]').disabled && !document.querySelector('input[name=\"export-mode\"][value=\"heightmap\"]').disabled"))
+d.find_element(By.ID, "export-cancel").click(); time.sleep(0.2)
+open_export("terrain")
+sizes = d.execute_script("return [...document.getElementById('terrain-size').options].map(o=>o.textContent)")
+check("terrain export offers the full-zoom detail size", any("Full zoom" in s for s in sizes), " | ".join(sizes))
+_Select(d.find_element(By.ID, "terrain-size")).select_by_value("4096"); time.sleep(0.3)
+check("terrain export estimates size and resolution", "4,096 × 4,096" in text("terrain-estimate"), text("terrain-estimate")[:120])
+t_ex = time.time()
+d.find_element(By.ID, "export-go").click()
+for _ in range(600):
+    time.sleep(0.5)
+    if glob.glob(os.path.join(DOWNLOADS, "terrain-4096x4096.png")) and not glob.glob(os.path.join(DOWNLOADS, "*.part")): break
+tex = glob.glob(os.path.join(DOWNLOADS, "terrain-4096x4096.png"))
+info, ok = text("export-status"), False
+if tex:
+    time.sleep(1)
+    from PIL import Image, ImageStat
+    with Image.open(tex[0]) as im:
+        im.load()
+        sd = ImageStat.Stat(im.convert("L")).stddev[0]
+        ok = im.size == (4096, 4096) and sd > 10
+        info = f"{im.size[0]}x{im.size[1]} {im.mode}, contrast {sd:.0f}, {time.time()-t_ex:.0f} s"
+        im.crop((1500, 1100, 2300, 1900)).save(str(SHOTS / "10b-terrain-export-crop.png"))
+check("the terrain exports as a full-detail 4096 px image", ok, info)
+open_export("heightmap")
+check("heightmap export explains the Unreal Engine scale", "Z scale" in text("terrain-estimate"), text("terrain-estimate")[-160:])
+d.find_element(By.ID, "export-go").click()
+for _ in range(300):
+    time.sleep(0.5)
+    hm = glob.glob(os.path.join(DOWNLOADS, "heightmap-4033x4033-16bit-*.png"))
+    if hm and not glob.glob(os.path.join(DOWNLOADS, "*.part")): break
+info, ok = text("export-status"), False
+if hm:
+    time.sleep(1)
+    with Image.open(hm[0]) as im:
+        im.load()
+        lo, hi = im.getextrema()
+        ok = im.size == (4033, 4033) and im.mode.startswith("I") and hi - lo > 8000
+        info = f"{os.path.basename(hm[0])}: {im.mode}, values {lo}..{hi}"
+        prev = im.point(lambda v: v / 256).convert("L").reduce(4)
+        prev.save(str(SHOTS / "10c-heightmap-preview.png"))
+check("the heightmap is a 16-bit greyscale PNG spanning the terrain's heights", ok, info)
+
+# Biome brush: paint a region, pick a preset, regenerate the terrain.
+before_px = map_pixel(640, 500)
+d.find_element(By.ID, "tool-biome").click(); time.sleep(0.2)
+check("the biome pen explains itself", "biome region" in text("guidance"), text("guidance"))
+REGION = [(460, 400), (660, 390), (670, 600), (470, 610)]
+for p in REGION: click_km(*p)
+click_km(*REGION[0]); time.sleep(0.5)
+check("a biome region closes on its first point", "Biomes" in text("shape-list") and not hidden("biome-fields"), text("feature-title"))
+check("painting a region returns the map to the live view", hidden("planned-box"))
+_Select(d.find_element(By.ID, "b-preset")).select_by_value("hot-desert"); time.sleep(0.4)
+check("a preset sets rainfall, humidity, forest and temperature", text("b-rain-value").startswith("80 ") and text("b-humid-value") == "8%" and text("b-forest-value") == "0%" and "27" in text("b-temp-value"), f"{text('b-rain-value')}, {text('b-humid-value')}, {text('b-forest-value')}, {text('b-temp-value')}")
+check("the region is named after its preset", "Hot desert" in text("shape-list"), text("shape-list").split("Biomes")[-1].strip().replace("\n", " | "))
+set_slider("b-feather", 20)
+check("each region's values can be edited", text("b-feather-value") == "20 km", text("b-feather-value"))
+d.find_element(By.ID, "b-regen").click()
+for _ in range(80):
+    time.sleep(0.5)
+    if "Terrain rendered" in text("export-status"): break
+after_px = map_pixel(640, 500)
+check("regenerating the terrain turns the region into desert", "Terrain rendered" in text("export-status") and after_px[0] > before_px[0] + 20 and after_px[0] > after_px[1], f"{before_px} -> {after_px}")
+shot("10d-biome-desert")
+_Select(d.find_element(By.ID, "b-preset")).select_by_value("rainforest"); time.sleep(0.4)
+d.find_element(By.ID, "b-regen").click()
+for _ in range(80):
+    time.sleep(0.5)
+    if "Terrain rendered" in text("export-status"): break
+forest_px = map_pixel(640, 500)
+check("a rainforest preset turns the same region deep green", forest_px[1] > forest_px[0] + 10 and sum(forest_px) < sum(after_px), f"{forest_px}")
+shot("10e-biome-forest")
+ActionChains(d).send_keys(Keys.ESCAPE).perform(); time.sleep(0.2)
+
+# Keep the planned features as ordinary guides.
+n_before = len(d.find_elements(By.CSS_SELECTOR, ".shape-row"))
+d.find_element(By.ID, "keep-planned").click(); wait_frames(3)
+n_after = len(d.find_elements(By.CSS_SELECTOR, ".shape-row"))
+check("planned features can be kept as editable guides", n_after > n_before + 5 and "(planned)" in text("shape-list"), f"{n_before} -> {n_after} rows; {text('export-status')}")
+lake_px = map_pixel(1100, 1150)
+check("kept lakes stay in their hollows instead of flooding the land", lake_px[1] > lake_px[2] or lake_px[0] > 80, f"land pixel {lake_px}")
+shot("10f-planned-kept")
+d.find_element(By.ID, "render-terrain").click()
+for _ in range(80):
+    time.sleep(0.5)
+    if "Terrain rendered" in text("export-status"): break
+check("the terrain renders again with the kept guides", "Terrain rendered" in text("export-status"), text("export-status")[:100])
+ActionChains(d).send_keys(Keys.ESCAPE).perform(); time.sleep(0.2)
+
+# Project file: save, clear, and open it again.
+n_rows = len(d.find_elements(By.CSS_SELECTOR, ".shape-row"))
+export("project"); time.sleep(2.5)
+saved = glob.glob(os.path.join(DOWNLOADS, "*.wmap.json"))
+check("a project file is saved", len(saved) == 1, ", ".join(os.path.basename(f) for f in saved))
+clear = d.find_element(By.ID, "clear"); clear.click(); time.sleep(0.2); clear.click(); wait_frames(2)
+check("clearing empties the map", len(d.find_elements(By.CSS_SELECTOR, ".shape-row .shape-pick")) <= 1)
+if saved:
+    d.execute_script("document.getElementById('import-file').hidden=false")
+    d.find_element(By.ID, "import-file").send_keys(saved[0]); wait_frames(4)
+    d.execute_script("document.getElementById('import-file').hidden=true")
+check("opening the project file restores every shape, mountain and river", len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) == n_rows and "Opened" in text("export-status"), f"{len(d.find_elements(By.CSS_SELECTOR, '.shape-row'))} of {n_rows} rows; {text('export-status')}")
+shot("09d-reopened")
+
+# Autosave: reload the page and the map comes back.
+time.sleep(1.5)
+errors_before_reload = d.execute_script("return window.__errors") or []
+d.refresh()
+d.execute_script("window.__errors=[];window.addEventListener('error',e=>__errors.push(String(e.message)));window.addEventListener('unhandledrejection',e=>__errors.push(String(e.reason)));")
+time.sleep(4)
+overlay = d.find_element(By.ID, "overlay")
+check("the map is restored from autosave after a reload", "Restored" in text("export-status") and len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) >= 5, text("export-status"))
 
 # Delete shape B with the two-step confirmation.
 d.find_elements(By.CSS_SELECTOR, ".shape-row .shape-pick")[1].click(); time.sleep(0.2)
@@ -371,7 +593,7 @@ btn.click(); wait_frames()
 check("second click deletes the shape", len(d.find_elements(By.CSS_SELECTOR, ".shape-row")) == n_before - 1)
 shot("09-deleted")
 
-errs = d.execute_script("return window.__errors")
+errs = errors_before_reload + (d.execute_script("return window.__errors") or [])
 check("no JavaScript errors", not errs, "; ".join(errs))
 d.quit()
 passed = sum(r[1] for r in results)

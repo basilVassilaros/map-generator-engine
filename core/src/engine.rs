@@ -5,22 +5,41 @@
 //! the change can affect, and regenerates only those. Results are identical
 //! to regenerating the whole map; `tests/incremental.rs` holds it to that.
 //!
-//! Shapes combine in list order, starting from open ocean: a land shape adds
-//! land, a water shape cuts water out of whatever came before it. The app
-//! orders shapes by nesting, so a lake inside a continent cuts into it and an
-//! island inside that lake adds land back. Highland shapes then raise (or
-//! lower) the ground inside them, with an escarpment at the edge.
+//! The map is built in two tiers.
+//!
+//! **Tier 1, the ground**, is local: each cell depends only on nearby shapes
+//! and mountains, so an edit recomputes just the cells it can reach. Shapes
+//! combine in list order, starting from open ocean. A land shape adds land
+//! at its own height (stepping up or down from any land beneath, with an
+//! escarpment at its edge); a water shape cuts a lake, sea or bay out of
+//! whatever came before. Mountains then add their height on top.
+//!
+//! **Tier 2, water that depends on connections**, covers the whole map:
+//! drawn rivers carve their channels downhill, and land lying below the
+//! surface of water it touches floods. A basin below sea level that no
+//! water reaches stays dry land. This tier is cheap, so it reruns in full
+//! after every edit, and only the cells it changed are redrawn.
 //!
 //! Water is tracked separately from elevation: each cell knows whether it is
-//! water and, if so, the height of its surface. The ocean's surface is sea
-//! level; a lake's surface is the height of the ground it sits in, so a lake
-//! on a plateau stays on the plateau.
+//! water and the height of its surface.
 
 use crate::coast::{
-    coast_bands, coastal_displacement, distance_to_segment, elevation_from_coast, highland_rise,
-    inland_base, lake_depth, CoastBands, Coastline, Frame, SegmentParams, Shape, ShapeKind, CLAMP_KM,
+    coast_bands, coast_rise, coastal_displacement, distance_to_segment, highland_rise, inland_base,
+    lake_depth, ocean_depth, CoastBands, Coastline, Frame, SegmentParams, Shape, ShapeKind,
+    AUTO_LEVEL, CLAMP_KM, MAX_HEIGHT_M, MIN_HEIGHT_M,
 };
+use crate::features::{curve_path, nearest_on_path, Mountain, Region, River};
 use crate::render;
+
+/// Cell kinds in `Engine::water`.
+pub const LAND: u8 = 0;
+pub const OCEAN: u8 = 1;
+pub const LAKE: u8 = 2;
+/// Land that flooded because it lies below water it touches.
+pub const FLOODED: u8 = 3;
+pub const RIVER: u8 = 4;
+/// A drawn pool (a river feature with a single point): standing water.
+pub const POOL: u8 = 5;
 
 /// Elevation of an empty map (open ocean), in metres.
 pub const EMPTY_ELEVATION: f32 = -3680.0;
@@ -150,14 +169,29 @@ pub struct Engine {
     /// World position (km) of the top-left corner of cell (0, 0).
     origin: [f32; 2],
     cell_km: f32,
+    /// Tier 1: the ground from shapes and mountains.
+    g_elev: Vec<f32>,
+    g_shore: Vec<f32>,
+    g_surface: Vec<f32>,
+    g_water: Vec<u8>,
+    /// How many land cells lie below the water nearest them. While this is
+    /// zero nothing can flood, so the whole-map flood pass is skipped.
+    low_land: i64,
+    /// The finished map, after rivers and flooding.
     elevation: Vec<f32>,
-    /// Signed distance (km) to the final coastline: positive on land, negative
-    /// in water. Decides what is water, and lets the renderer blend land and
-    /// water across the edge (edge smoothing).
+    /// Signed distance (km) to the coastline: positive on land, negative in
+    /// water. Lets the renderer blend land and water across the edge.
     shore: Vec<f32>,
-    /// Height (metres) of the water surface, for water cells: 0 for the
-    /// ocean, the surrounding ground's height for a lake.
+    /// Height (metres) of the water surface, for water cells.
     surface: Vec<f32>,
+    /// What each cell is: see the `LAND`, `OCEAN`... constants.
+    water: Vec<u8>,
+    /// Cells tier 2 changed last time, so they can be put back before it reruns.
+    touched: Vec<u32>,
+    mountains: Vec<Mountain>,
+    rivers: Vec<River>,
+    /// Biome regions: they shape the terrain render, not the live map.
+    regions: Vec<Region>,
     rgba: Vec<u8>,
     /// Width (pixels) of the land/water blend along coastlines. 0 = off.
     smoothing: f32,
@@ -187,9 +221,19 @@ impl Engine {
             height,
             origin,
             cell_km,
+            g_elev: vec![EMPTY_ELEVATION; cells],
+            g_shore: vec![-CLAMP_KM; cells],
+            g_surface: vec![0.0; cells],
+            g_water: vec![OCEAN; cells],
+            low_land: 0,
             elevation: vec![EMPTY_ELEVATION; cells],
             shore: vec![-CLAMP_KM; cells],
             surface: vec![0.0; cells],
+            water: vec![OCEAN; cells],
+            touched: Vec::new(),
+            mountains: Vec::new(),
+            rivers: Vec::new(),
+            regions: Vec::new(),
             rgba: vec![0; cells * 4],
             smoothing: 0.0,
             world_seed: 0,
@@ -224,6 +268,47 @@ impl Engine {
         &self.surface
     }
 
+    /// The ground before rivers were cut into it and before any flooding.
+    pub fn ground(&self) -> &[f32] {
+        &self.g_elev
+    }
+
+    pub fn mountains(&self) -> &[Mountain] {
+        &self.mountains
+    }
+
+    /// The drawn rivers, with their curves.
+    pub fn rivers(&self) -> &[River] {
+        &self.rivers
+    }
+
+    pub fn regions(&self) -> &[Region] {
+        &self.regions
+    }
+
+    /// Replace the biome regions. They only affect the terrain render.
+    pub fn set_regions(&mut self, regions: Vec<Region>) {
+        self.regions = regions.into_iter().filter(|r| r.points.len() >= 3).collect();
+    }
+
+    /// The cell containing a world position, if it is on the map.
+    pub fn cell_at(&self, p: [f32; 2]) -> Option<usize> {
+        self.cell_of(p)
+    }
+
+    /// What each cell is: `LAND`, `OCEAN`, `LAKE`, `FLOODED`, `RIVER` or `POOL`.
+    pub fn water(&self) -> &[u8] {
+        &self.water
+    }
+
+    pub fn cell_km(&self) -> f32 {
+        self.cell_km
+    }
+
+    pub fn origin(&self) -> [f32; 2] {
+        self.origin
+    }
+
     pub fn rgba(&self) -> &[u8] {
         &self.rgba
     }
@@ -252,13 +337,67 @@ impl Engine {
     /// Convenience for a single coastline (id 0, frame at the origin).
     pub fn set_coast(&mut self, coast: Option<Coastline>) -> Rect {
         let seed = coast.as_ref().map_or(0, |c| c.seed);
-        let shapes = coast.into_iter().map(|c| Shape { id: 0, coast: c, frame: Default::default(), kind: ShapeKind::Land }).collect();
+        let shapes = coast.into_iter().map(|c| Shape { id: 0, coast: c, frame: Default::default(), kind: ShapeKind::Land, height: 300.0 }).collect();
         self.set_shapes(seed, shapes)
+    }
+
+    /// Replace the shapes, keeping the current mountains and rivers.
+    pub fn set_shapes(&mut self, world_seed: u32, shapes: Vec<Shape>) -> Rect {
+        let (mountains, rivers) = (self.mountains.clone(), self.rivers.clone());
+        self.set_guides(world_seed, shapes, mountains, rivers)
     }
 
     /// Replace the guides. Returns the rectangle of pixels that changed
     /// (empty if nothing did).
-    pub fn set_shapes(&mut self, world_seed: u32, shapes: Vec<Shape>) -> Rect {
+    pub fn set_guides(&mut self, world_seed: u32, shapes: Vec<Shape>, mountains: Vec<Mountain>, rivers: Vec<River>) -> Rect {
+        let mut dirty = self.update_ground(world_seed, shapes);
+
+        // Mountains: any that changed, appeared or went redo their footprint.
+        let mut mountains: Vec<Mountain> = mountains
+            .into_iter()
+            .filter(|m| !m.points.is_empty() && m.height.is_finite() && m.width_km.is_finite())
+            .map(|mut m| {
+                m.height = m.height.clamp(0.0, 9000.0);
+                m.width_km = m.width_km.clamp(1.0, 400.0);
+                m.rugged = m.rugged.clamp(0.0, 1.0);
+                m.path = curve_path(&m.points, m.curviness, &m.bends);
+                m.rect = self.path_rect(&m.path, m.reach_km());
+                m
+            })
+            .collect();
+        std::mem::swap(&mut self.mountains, &mut mountains);
+        let old = mountains;
+        let mut redo = Rect::EMPTY;
+        for m in &self.mountains {
+            if !old.contains(m) {
+                redo = redo.union(m.rect);
+            }
+        }
+        for m in &old {
+            if !self.mountains.contains(m) {
+                redo = redo.union(m.rect);
+            }
+        }
+        if !redo.is_empty() && self.base_seed.is_none() {
+            self.compute_base();
+        }
+        if !redo.is_empty() {
+            dirty = dirty.union(self.compute_terrain(redo.intersect(self.full_rect()), None));
+        }
+
+        self.rivers = rivers
+            .into_iter()
+            .filter(|r| !r.points.is_empty())
+            .map(|mut r| {
+                r.path = curve_path(&r.points, r.curviness, &r.bends);
+                r
+            })
+            .collect();
+        self.finish(dirty)
+    }
+
+    /// Tier 1 for shapes: returns the cells whose ground changed.
+    fn update_ground(&mut self, world_seed: u32, shapes: Vec<Shape>) -> Rect {
         let shapes: Vec<Shape> = shapes
             .into_iter()
             .filter(|s| s.coast.is_valid())
@@ -266,23 +405,22 @@ impl Engine {
                 for p in s.coast.params.iter_mut() {
                     *p = p.sanitized();
                 }
-                if let ShapeKind::Highland(h) = s.kind {
-                    let h = if h.is_finite() { h } else { 0.0 };
-                    s.kind = ShapeKind::Highland(h.clamp(crate::coast::MIN_HIGHLAND_M, crate::coast::MAX_HIGHLAND_M));
+                if s.height != AUTO_LEVEL || s.kind == ShapeKind::Land {
+                    let h = if s.height.is_finite() { s.height } else { 0.0 };
+                    s.height = h.clamp(MIN_HEIGHT_M, MAX_HEIGHT_M);
                 }
                 s
             })
             .collect();
 
         if world_seed != self.world_seed || (self.base_seed.is_none() && !shapes.is_empty()) {
-            // The lowland under every shape changes: start over.
+            // The relief under every shape changes: start over.
             self.world_seed = world_seed;
             self.compute_base();
             self.shapes = shapes;
             self.caches = (0..self.shapes.len()).map(|k| self.build_cache(k, None)).collect();
             let all = self.full_rect();
             self.compute_terrain(all, None);
-            self.shade(all);
             return all;
         }
 
@@ -306,8 +444,8 @@ impl Engine {
             let old_cache = old_caches[j].take().expect("each old shape is matched once");
             let new = &self.shapes[k];
 
-            if old.kind != new.kind {
-                // Kind or highland height changed: everything it reaches changes.
+            if old.kind != new.kind || old.height != new.height {
+                // Kind or height changed: everything it reaches changes.
                 tasks.push(Task::All(old_cache.rect));
                 if old.coast == new.coast && old.frame == new.frame {
                     caches.push(old_cache);
@@ -401,12 +539,201 @@ impl Engine {
             };
             changed = changed.union(written);
         }
+        changed
+    }
+
+    /// Cells within `reach_km` of a path.
+    fn path_rect(&self, pts: &[[f32; 2]], reach_km: f32) -> Rect {
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in pts {
+            x0 = x0.min(p[0]);
+            y0 = y0.min(p[1]);
+            x1 = x1.max(p[0]);
+            y1 = y1.max(p[1]);
+        }
+        self.km_box_to_cells(x0 - reach_km, y0 - reach_km, x1 + reach_km, y1 + reach_km)
+    }
+
+    #[inline]
+    fn cell_of(&self, p: [f32; 2]) -> Option<usize> {
+        let x = ((p[0] - self.origin[0]) / self.cell_km).floor();
+        let y = ((p[1] - self.origin[1]) / self.cell_km).floor();
+        if x < 0.0 || y < 0.0 || x >= self.width as f32 || y >= self.height as f32 {
+            return None;
+        }
+        Some(y as usize * self.width as usize + x as usize)
+    }
+
+    #[inline]
+    fn restore(&mut self, i: usize) {
+        self.elevation[i] = self.g_elev[i];
+        self.shore[i] = self.g_shore[i];
+        self.surface[i] = self.g_surface[i];
+        self.water[i] = self.g_water[i];
+    }
+
+    fn bounds_of(&self, cells: &[u32]) -> Rect {
+        let mut r = Rect::EMPTY;
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for &i in cells {
+            let (x, y) = (i % self.width, i / self.width);
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+        }
+        if !cells.is_empty() {
+            r = Rect { x0, y0, x1, y1 };
+        }
+        r
+    }
+
+    /// Tier 2: rivers and flooding over the whole map, from the tier 1
+    /// ground. `dirty` is the ground that changed. Returns the pixels to redraw.
+    fn finish(&mut self, dirty: Rect) -> Rect {
+        let before = std::mem::take(&mut self.touched);
+        let mut changed = dirty.union(self.bounds_of(&before));
+        for &i in &before {
+            self.restore(i as usize);
+        }
+        for cy in dirty.y0..dirty.y1 {
+            let a = (cy * self.width + dirty.x0) as usize;
+            let b = (cy * self.width + dirty.x1) as usize;
+            self.elevation[a..b].copy_from_slice(&self.g_elev[a..b]);
+            self.shore[a..b].copy_from_slice(&self.g_shore[a..b]);
+            self.surface[a..b].copy_from_slice(&self.g_surface[a..b]);
+            self.water[a..b].copy_from_slice(&self.g_water[a..b]);
+        }
+        let rivers = std::mem::take(&mut self.rivers);
+        for river in &rivers {
+            self.carve(river);
+        }
+        self.rivers = rivers;
+        self.flood();
+        changed = changed.union(self.bounds_of(&self.touched));
         if changed.is_empty() {
             return Rect::EMPTY;
         }
         let pixels = changed.grow(1, self.width, self.height);
         self.shade(pixels);
         pixels
+    }
+
+    /// Land below the surface of water it touches becomes part of that
+    /// water. Spreads cell to cell, so it follows the ground: a basin that no
+    /// water can reach stays dry however low it lies.
+    fn flood(&mut self) {
+        if self.low_land == 0 {
+            return;
+        }
+        let (w, h) = (self.width as usize, self.height as usize);
+        let mut queue: Vec<u32> = Vec::new();
+        let wet = -0.5 * self.cell_km;
+        let spread = |e: &mut Self, i: usize, queue: &mut Vec<u32>| {
+            let level = e.surface[i];
+            let (x, y) = (i % w, i / w);
+            let mut visit = |j: usize| {
+                if e.water[j] == LAND && e.elevation[j] < level {
+                    e.water[j] = FLOODED;
+                    e.surface[j] = level;
+                    e.shore[j] = wet;
+                    e.touched.push(j as u32);
+                    queue.push(j as u32);
+                }
+            };
+            if x > 0 { visit(i - 1); }
+            if x + 1 < w { visit(i + 1); }
+            if y > 0 { visit(i - w); }
+            if y + 1 < h { visit(i + w); }
+        };
+        for i in 0..w * h {
+            // Rivers don't flood their banks; seas and lakes do.
+            if self.water[i] == OCEAN || self.water[i] == LAKE {
+                spread(self, i, &mut queue);
+            }
+        }
+        while let Some(i) = queue.pop() {
+            spread(self, i as usize, &mut queue);
+        }
+    }
+
+    /// Carve a drawn river from its first point to its last. The water
+    /// surface only ever descends, so the river always runs downhill, cutting
+    /// through any rise in its way; its banks slope up to the ground beside it.
+    fn carve(&mut self, river: &River) {
+        let cell = self.cell_km;
+        let half = (river.width_km * 0.5).max(cell * 0.6);
+        let bank = half + (river.depth_m / 120.0).max(cell * 1.5); // banks rise ~120 m per km
+        let pts = &river.path;
+        // Walk the path in equal steps of half a cell.
+        let step = cell * 0.5;
+        let mut samples: Vec<[f32; 2]> = vec![pts[0]];
+        let mut carried = 0.0; // distance already covered towards the next sample
+        for s in pts.windows(2) {
+            let (a, b) = (s[0], s[1]);
+            let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+            let mut at = step - carried;
+            while at <= len {
+                let t = at / len;
+                samples.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+                at += step;
+            }
+            carried = len - (at - step);
+        }
+        // Water surface along the path: never rising, and ending where the
+        // river meets a sea or lake.
+        let mut level = f32::MAX;
+        let mut levels: Vec<f32> = Vec::with_capacity(samples.len());
+        for p in &samples {
+            let Some(i) = self.cell_of(*p) else { levels.push(level); continue };
+            if self.g_water[i] != LAND {
+                level = level.min(self.g_surface[i]);
+            } else {
+                level = level.min(self.g_elev[i] - river.depth_m * 0.25).max(self.sea_floor_guard(i));
+            }
+            levels.push(level);
+        }
+        if level == f32::MAX {
+            return;
+        }
+        let r = self.path_rect(pts, bank).intersect(self.full_rect());
+        for cy in r.y0..r.y1 {
+            for cx in r.x0..r.x1 {
+                let i = (cy * self.width + cx) as usize;
+                if self.g_water[i] != LAND {
+                    continue;
+                }
+                let p = self.cell_center(cx, cy);
+                // Nearest sample (paths are short, so a direct search is fine
+                // within the river's own rectangle).
+                let (d, along) = nearest_on_path(p, pts);
+                if d > bank {
+                    continue;
+                }
+                let k = ((along / step).round() as usize).min(levels.len() - 1);
+                let surface = levels[k];
+                if d <= half {
+                    self.elevation[i] = self.elevation[i].min(surface - river.depth_m);
+                    self.surface[i] = surface;
+                    self.water[i] = if pts.len() == 1 { POOL } else { RIVER };
+                    self.shore[i] = -0.3 * cell;
+                    self.touched.push(i as u32);
+                } else {
+                    let rise = (d - half) / (bank - half);
+                    let limit = surface + rise * rise * (self.g_elev[i] - surface).max(0.0);
+                    if limit < self.elevation[i] {
+                        self.elevation[i] = limit;
+                        self.touched.push(i as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A river never cuts below sea level on its way down.
+    #[inline]
+    fn sea_floor_guard(&self, _i: usize) -> f32 {
+        0.5
     }
 
     fn shade(&mut self, pixels: Rect) {
@@ -598,13 +925,15 @@ impl Engine {
                     }
                 }
                 let idx = (cy * self.width + cx) as usize;
-                // Start from open ocean, then apply each land and water shape
-                // in order: land keeps whichever reaches furthest inland,
-                // water cuts into it. Highlands add up separately.
-                let mut level = -CLAMP_KM;
+                // Start from open ocean, then apply each shape in order.
+                let mut level = -CLAMP_KM; // signed distance to the nearest water's edge
                 let mut level_params = far;
-                let mut lake = false; // the water here belongs to a water shape
-                let mut rise = 0.0f32;
+                let mut lake: Option<f32> = None; // that water's height, if it is a water shape
+                let mut ground = 0.0f32; // height of the land surface here
+                // The runner-up land shape: where two overlap, the winner switches
+                // along a line, so their slope settings are blended across it
+                // rather than changing abruptly into a cliff.
+                let mut second: Option<(f32, SegmentParams)> = None;
                 for (shape, cache) in self.shapes.iter().zip(&self.caches) {
                     if !cache.rect.contains(cx, cy) {
                         continue;
@@ -624,35 +953,90 @@ impl Engine {
                     };
                     match shape.kind {
                         ShapeKind::Land => {
+                            // Over open sea (no land beneath) a shape simply sits at its
+                            // height inside its outline; the coast's own ramp, applied
+                            // below, shapes the shore once. Over land it steps up or
+                            // down with an escarpment, by this segment's slope.
+                            let under = crate::coast::smoothstep(0.0, 8.0, level.max(0.0));
+                            let edge = crate::coast::smoothstep(0.0, 2.0, shifted);
+                            let step = edge * (1.0 - under) + highland_rise(shifted, &params) * under;
+                            ground += (shape.height - ground) * step;
                             if shifted > level {
+                                if lake.is_none() && level > 0.0 {
+                                    second = Some((level, level_params));
+                                }
                                 level = shifted;
                                 level_params = params;
-                                lake = false;
+                                lake = None;
+                            } else if lake.is_none() && shifted > 0.0 && second.map_or(true, |(l, _)| shifted > l) {
+                                second = Some((shifted, params));
                             }
                         }
                         ShapeKind::Water => {
                             if -shifted < level {
                                 level = -shifted;
                                 level_params = params;
-                                lake = true;
+                                lake = Some(shape.height);
+                                second = None;
                             }
                         }
-                        ShapeKind::Highland(height) => rise += height * highland_rise(shifted, &params),
                     }
                 }
-                // Highlands raise the ground, and with it any lake sitting in
-                // it; the ocean always stays at sea level.
-                let relative = elevation_from_coast(self.base[idx], level, &level_params);
-                let (elevation, surface) = if level >= 0.0 {
-                    (relative + rise, 0.0)
-                } else if lake {
-                    (rise + lake_depth(level, &level_params), rise)
-                } else {
-                    (relative, 0.0)
+                if let (Some((other, other_params)), true) = (second, lake.is_none()) {
+                    let gap = level - other;
+                    if level > 0.0 && gap < 40.0 {
+                        let t = 0.5 + 0.5 * crate::coast::smoothstep(0.0, 40.0, gap);
+                        level_params = SegmentParams::lerp(other_params, level_params, t);
+                    }
+                }
+                let mut peaks = 0.0f32;
+                if !self.mountains.is_empty() {
+                    let p = self.cell_center(cx, cy);
+                    for m in &self.mountains {
+                        if m.rect.contains(cx, cy) {
+                            peaks += m.height_at(p, self.cell_km);
+                        }
+                    }
+                }
+                // The surface of the water nearest this cell: sea level, or a
+                // lake's own level (by default, the height of the ground it sits in).
+                let nearest_water = match lake {
+                    Some(h) if h != AUTO_LEVEL => h,
+                    // A lake following the ground sits in a slight hollow:
+                    // just below the lowest the land's relief can dip, so it
+                    // never spills over the country around it.
+                    Some(_) => ground - 0.36 * ground.clamp(0.0, 300.0) - 5.0,
+                    None => 0.0,
                 };
-                self.elevation[idx] = elevation;
-                self.surface[idx] = surface;
-                self.shore[idx] = level;
+                let (elevation, kind, surface, shore) = if level >= 0.0 {
+                    // Land rises from the water's edge to its full height,
+                    // with gentle relief that fades out at the shore.
+                    let rise = coast_rise(level, &level_params);
+                    // Relief is in proportion to the land's own height, so it
+                    // can never dip the ground below the water it rises from.
+                    let relief = (self.base[idx] - 200.0) * 0.6 * rise * (ground.max(0.0) / 300.0).min(1.0);
+                    (nearest_water + (ground - nearest_water) * rise + relief + peaks, LAND, 0.0, level)
+                } else if peaks > 20.0 {
+                    // A mountain standing in water breaks the surface: an island.
+                    // Its distance from the water grows with its height, so only the low
+                    // fringe of such an island is beach.
+                    (nearest_water + peaks - 20.0, LAND, 0.0, ((peaks - 20.0) * 0.01).max(0.4 * self.cell_km))
+                } else if lake.is_some() {
+                    (nearest_water + lake_depth(level, &level_params) + peaks, LAKE, nearest_water, level)
+                } else {
+                    (ocean_depth(level, &level_params) + peaks, OCEAN, 0.0, level)
+                };
+                // Keep count of land lying below its nearest water (see `low_land`).
+                let was_low = self.g_water[idx] == LAND && self.g_elev[idx] < self.g_surface[idx];
+                let low_surface = if kind == LAND { nearest_water } else { surface };
+                let is_low = kind == LAND && elevation < low_surface;
+                self.low_land += is_low as i64 - was_low as i64;
+                self.g_elev[idx] = elevation;
+                self.g_water[idx] = kind;
+                // For land, remember the level of the nearest water: what it
+                // would flood to.
+                self.g_surface[idx] = low_surface;
+                self.g_shore[idx] = shore;
                 row_min = row_min.min(cx);
                 row_max = row_max.max(cx);
             }

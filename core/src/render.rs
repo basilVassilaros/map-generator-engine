@@ -21,7 +21,7 @@ const RAMP: &[(f32, [f32; 3])] = &[
     (2500.0, [217.0, 212.0, 204.0]),
 ];
 
-fn tint(elevation: f32) -> [f32; 3] {
+pub(crate) fn tint(elevation: f32) -> [f32; 3] {
     if elevation <= RAMP[0].0 {
         return RAMP[0].1;
     }

@@ -35,14 +35,14 @@ export class PngWriter {
   private drained: Promise<void>;
   private rowsWritten = 0;
 
-  /** An 8-bit RGB image. */
-  constructor(private width: number, private height: number) {
+  /** An 8-bit RGB image, or a 16-bit greyscale one (for heightmaps). */
+  constructor(private width: number, private height: number, format: "rgb8" | "gray16" = "rgb8") {
     this.parts.push(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
     const ihdr = new Uint8Array(13);
     const v = new DataView(ihdr.buffer);
     v.setUint32(0, width);
     v.setUint32(4, height);
-    ihdr.set([8, 2, 0, 0, 0], 8); // bit depth 8, colour type RGB
+    ihdr.set(format === "gray16" ? [16, 0, 0, 0, 0] : [8, 2, 0, 0, 0], 8); // bit depth and colour type: 16-bit grey, or 8-bit RGB
     this.parts.push(...chunk("IHDR", ihdr));
 
     // PNG image data is a zlib stream, which is what "deflate" produces here.
@@ -70,6 +70,27 @@ export class PngWriter {
         out[o++] = rgba[i];
         out[o++] = rgba[i + 1];
         out[o++] = rgba[i + 2];
+      }
+    }
+    this.rowsWritten += rows;
+    await this.writer.write(out);
+  }
+
+  /**
+   * Append rows of a heightmap: each height (m) is mapped from `low`..`low + span`
+   * onto 0..65535, big-endian as PNG requires.
+   */
+  async addHeights(heights: Float32Array, rows: number, low: number, span: number): Promise<void> {
+    const w = this.width;
+    const out = new Uint8Array(rows * (1 + w * 2));
+    let o = 0;
+    for (let r = 0; r < rows; r++) {
+      out[o++] = 0;
+      for (let x = 0; x < w; x++) {
+        const v = Math.round(((heights[r * w + x] - low) / span) * 65535);
+        const c = v < 0 ? 0 : v > 65535 ? 65535 : v;
+        out[o++] = c >> 8;
+        out[o++] = c & 255;
       }
     }
     this.rowsWritten += rows;

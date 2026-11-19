@@ -6,7 +6,7 @@
 // the latest state and never on a backlog.
 
 import { CoreHost } from "./core-host";
-import type { FromCore, Guides, Rect, ToCore } from "./protocol";
+import type { ClimateSettings, FromCore, Guides, Rect, ToCore } from "./protocol";
 
 import { WORKER_SOURCE, wasmBytes } from "./embedded";
 
@@ -18,6 +18,15 @@ export interface Frame {
   kind: ToCore["type"];
   /** Which `init` this frame belongs to. Frames from an older init are stale. */
   initVersion: number;
+  /** The request's version: later requests have higher numbers. */
+  version: number;
+  /** For a terrain render: how many lake and river cells formed. */
+  lakes?: number;
+  rivers?: number;
+  /** For a terrain render: what fine-detail workers need (see `terrain-hq.ts`). */
+  structure?: ArrayBuffer;
+  planned?: ArrayBuffer;
+  range?: [number, number];
 }
 
 
@@ -35,6 +44,7 @@ export class EngineClient {
   private sentAt = new Map<number, number>();
   private lastInit: ToCore | null = null;
   private lastGuides: ToCore | null = null;
+  private waitingTerrain: ToCore | null = null;
   private appliedInit = 0;
 
   constructor() {
@@ -66,18 +76,29 @@ export class EngineClient {
     return msg.version;
   }
 
-  setGuides(guides: Guides): void {
+  /** Send the latest guides. Returns the request's version. */
+  setGuides(guides: Guides): number {
     this.waitingGuides = { type: "guides", version: ++this.version, guides: structuredClone(guides) };
     this.lastGuides = this.waitingGuides;
+    // New guides make any terrain render still waiting out of date.
+    this.waitingTerrain = null;
+    this.pump();
+    return this.version;
+  }
+
+  /** Ask for a terrain render of the map as it stands once pending edits are applied. */
+  renderTerrain(climate: ClimateSettings): void {
+    this.waitingTerrain = { type: "terrain", version: ++this.version, climate };
     this.pump();
   }
 
   private pump(): void {
     if (this.inFlight) return;
-    const next = this.waitingInit ?? this.waitingGuides;
+    const next = this.waitingInit ?? this.waitingGuides ?? this.waitingTerrain;
     if (!next) return;
     if (next === this.waitingInit) this.waitingInit = null;
-    else this.waitingGuides = null;
+    else if (next === this.waitingGuides) this.waitingGuides = null;
+    else this.waitingTerrain = null;
     this.inFlight = next;
     this.sentAt.set(next.version, performance.now());
     const msg = next.type === "init" ? { ...next, wasm: wasmBytes() } : next;
@@ -110,6 +131,12 @@ export class EngineClient {
         totalMs: performance.now() - sent,
         kind: request?.type ?? "guides",
         initVersion: this.appliedInit,
+        version: out.version,
+        lakes: out.lakes,
+        rivers: out.rivers,
+        structure: out.structure,
+        planned: out.planned,
+        range: out.range,
       });
     }
     this.pump();

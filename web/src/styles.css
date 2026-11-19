@@ -320,3 +320,22 @@ select {
 .width-choice { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 .width-choice[hidden] { display: none; }
 .width-choice .hint { margin: 0; }
+
+#terrain-dialog p { margin: 0 0 12px; }
+#terrain-dialog .check { margin-bottom: 16px; }
+.inline-input span { font-size: 14px; color: var(--ink-muted); }
+#auto-level-row { margin-top: 4px; }
+#auto-level-row[hidden] { display: none; }
+.shape-row.feature .shape-kind { color: var(--ink-muted); }
+.list-head { margin: 10px 0 2px; font-size: 12.5px; font-weight: 600; color: var(--ink-muted); list-style: none; }
+
+.planned { display: grid; gap: 6px; margin-top: 4px; }
+.planned .hint { margin: 0; }
+#biome-fields select { width: 100%; }
+#b-regen { width: 100%; margin: 4px 0 8px; }
+#terrain-options select { width: 100%; margin-bottom: 8px; }
+.choice.unavailable { opacity: 0.55; cursor: default; }
+.planned .check { white-space: normal; align-items: flex-start; line-height: 1.3; }
+.planned .check input { margin-top: 2px; }
+.planned button { white-space: normal; }
+.planned[hidden] { display: none; }

@@ -4,7 +4,9 @@
 // guide overlay. Pan and zoom gestures are passed to the app.
 
 import { DEFAULT_VALUES, NO_ADJUSTMENT, effective, toParams, type SliderValues } from "./params";
-import type { Guides, Vec2 } from "./protocol";
+import { closedCurve, curvePath, segmentMiddle } from "./curve";
+import { biome, DEFAULT_BIOME } from "./biomes";
+import type { Guides, PlannedFeatures, Vec2 } from "./protocol";
 
 export interface ShapeFrame {
   x: number;
@@ -14,17 +16,58 @@ export interface ShapeFrame {
   scale: number;
 }
 
-export type ShapeKindName = "land" | "water" | "highland";
+export type ShapeKindName = "land" | "water";
 
-const KIND_NAMES: Record<ShapeKindName, string> = { land: "Landmass", water: "Lake", highland: "Highland" };
-export const DEFAULT_HIGHLAND_M = 800;
+const KIND_NAMES: Record<ShapeKindName, string> = { land: "Landmass", water: "Lake" };
+export const DEFAULT_LAND_M = 300;
+
+/** A mountain (peak or range) or a river (pool or stream) drawn as points. */
+export interface PathFeature {
+  id: number;
+  kind: FeatureKind;
+  name: string;
+  /** One point is a single peak or a pool; more make a range or a river (first point upstream). */
+  points: Vec2[];
+  seed: number;
+  /** Mountain: summit height (m). */
+  height: number;
+  /** Mountain: how far the slopes spread (km). River: width of the water (km). */
+  width: number;
+  /** Mountain: 0..1 ruggedness. */
+  rugged: number;
+  /** 0 straight segments .. 1 a smooth curve through the points. */
+  curviness: number;
+  /** How far (km) each segment is bowed sideways; one per segment. */
+  bends: number[];
+  /** River: channel depth (m). */
+  depth: number;
+  hidden: boolean;
+  locked: boolean;
+  /** Biome regions only: the preset it started from and its climate. */
+  biome?: string;
+  rainfall?: number;
+  humidity?: number;
+  forest?: number;
+  /** Mean temperature at sea level (°C), or null to follow the latitude. */
+  temp?: number | null;
+  /** Width of the soft edge (km). */
+  feather?: number;
+}
+
+export type FeatureKind = "mountain" | "river" | "biome";
+export type ToolName = "coast" | FeatureKind;
+
+/** New mountains and rivers start moderately curved. */
+export const DEFAULT_CURVINESS = 0.5;
 
 export interface ShapeModel {
   id: number;
   name: string;
   kind: ShapeKindName;
-  /** For highlands: metres above (or, if negative, below) the land around. */
+  /** Land: height of its surface (m). Water: height of the water surface (m), unless `autoLevel`. */
   height: number;
+  /** Water: take the surface level from the ground around it. */
+  autoLevel: boolean;
   points: Vec2[];
   /** Coastline slider values for the whole shape. */
   base: SliderValues;
@@ -74,6 +117,8 @@ type Corner = 0 | 1 | 2 | 3; // top-left, top-right, bottom-right, bottom-left
 
 type Drag =
   | { kind: "point"; shape: number; index: number }
+  | { kind: "fpoint"; feature: number; index: number }
+  | { kind: "fbend"; feature: number; index: number; from: number; start: Vec2; normal: Vec2 }
   | { kind: "image"; mode: "move" | "rotate" | { corner: Corner }; start: Vec2; from: ImageBox; moved: boolean }
   | { kind: "pan"; x: number; y: number; moved: boolean; onClick: "deselect" | "undo-point" | "none" }
   | {
@@ -102,7 +147,11 @@ const DRAG_THRESHOLD_PX = 4;
 
 const GUIDE = "#ffffff";
 const WATER_GUIDE = "#8fdcff";
-const HIGHLAND_GUIDE = "#ffc978";
+const MOUNTAIN_GUIDE = "#ffc978";
+const RIVER_GUIDE = "#7fe3ff";
+const PLANNED_RIVER = "rgba(150, 230, 255, 0.85)";
+const PLANNED_HILL = "rgba(255, 214, 150, 0.8)";
+const PLANNED_LAKE = "rgba(150, 230, 255, 0.9)";
 const HIGHLIGHT = "#f2b01e";
 const HALO = "rgba(10, 20, 28, 0.45)";
 
@@ -152,7 +201,18 @@ export class CoastEditor {
   /** Grid spacing in km, or 0 to choose automatically from the zoom. */
   gridKm = 0;
   showGrid = true;
-  readonly worldSeed = newSeed();
+  worldSeed = newSeed();
+  /** Mountains and rivers. */
+  features: PathFeature[] = [];
+  /** Which pen is active. */
+  tool: ToolName = "coast";
+  /** Points of the mountain or river being drawn, or null. */
+  featureDraft: Vec2[] | null = null;
+  /** The selected mountain, river or biome region, if any. */
+  featureSelected: number | null = null;
+  /** What the last terrain render planned, shown faintly over the map. */
+  planned: PlannedFeatures | null = null;
+  showPlanned = true;
   onEdit: (kind: EditKind) => void = () => {};
   /** Drag to pan, in CSS pixels. */
   onPan: (dx: number, dy: number) => void = () => {};
@@ -241,11 +301,275 @@ export class CoastEditor {
         seed: s.seed,
         frame: s.frame,
         kind: s.kind,
-        height: s.kind === "highland" ? s.height : 0,
+        height: s.kind === "water" && s.autoLevel ? -Infinity : s.height,
         points: s.points,
         params: s.adjust.map((a) => toParams(effective(s.base, a))),
       })),
+      mountains: this.features
+        .filter((f) => f.kind === "mountain" && !f.hidden)
+        .map((f) => ({ id: f.id, seed: f.seed, height: f.height, width: f.width, rugged: f.rugged, curviness: f.curviness, bends: f.bends, points: f.points })),
+      rivers: this.features
+        .filter((f) => f.kind === "river" && !f.hidden)
+        .map((f) => ({ id: f.id, width: f.width, depth: f.depth, curviness: f.curviness, bends: f.bends, points: f.points })),
+      regions: this.features
+        .filter((f) => f.kind === "biome" && !f.hidden && f.points.length >= 3)
+        .map((f) => {
+          const preset = biome(f.biome ?? DEFAULT_BIOME);
+          return {
+            id: f.id,
+            rainfall: f.rainfall ?? preset.rainfall,
+            humidity: f.humidity ?? preset.humidity,
+            forest: f.forest ?? preset.forest,
+            temp: f.temp === undefined ? preset.temp : f.temp,
+            feather: f.feather ?? 40,
+            points: closedCurve(f.points, f.curviness),
+          };
+        }),
     };
+  }
+
+  // --- mountains and rivers ---
+
+  feature(id: number | null): PathFeature | undefined {
+    return this.features.find((f) => f.id === id);
+  }
+
+  /** Pick a pen. Mountains and rivers start drawing straight away. */
+  setTool(tool: ToolName): void {
+    this.tool = tool;
+    this.featureDraft = tool === "coast" ? null : [];
+    if (tool !== "coast") {
+      if (this.draft && this.shapes.length) this.draft = null;
+      this.selection = null;
+      this.referenceSelected = false;
+      this.featureSelected = null;
+    }
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  /** Finish the mountain or river being drawn (one point is enough), or the biome region (three or more). */
+  finishFeature(): void {
+    const points = this.featureDraft;
+    if (!points || this.tool === "coast") return;
+    if (this.tool === "biome") {
+      if (points.length >= 3) this.addBiome(points, DEFAULT_BIOME);
+    } else if (points.length) {
+      const mountain = this.tool === "mountain";
+      const count = this.features.filter((f) => f.kind === this.tool).length + 1;
+      const single = points.length === 1;
+      this.addFeature({
+        kind: mountain ? "mountain" : "river",
+        name: `${mountain ? (single ? "Peak" : "Range") : single ? "Pool" : "River"} ${count}`,
+        points,
+        height: 2500,
+        width: mountain ? 60 : single ? 20 : 4,
+        rugged: 0.6,
+        curviness: DEFAULT_CURVINESS,
+        depth: 30,
+      });
+    }
+    // Stay in the tool, ready to draw the next one.
+    this.featureDraft = [];
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  private addFeature(f: Omit<PathFeature, "id" | "seed" | "bends" | "hidden" | "locked"> & Partial<PathFeature>, select = true): PathFeature {
+    const feature: PathFeature = { id: this.nextId++, seed: newSeed(), bends: f.points.slice(1).map(() => 0), hidden: false, locked: false, ...f };
+    this.features.push(feature);
+    if (select) this.featureSelected = feature.id;
+    this.onEdit("shape");
+    this.onEdit("list");
+    return feature;
+  }
+
+  private addBiome(points: Vec2[], key: string): PathFeature {
+    const preset = biome(key);
+    const count = this.features.filter((f) => f.kind === "biome" && f.biome === key).length + 1;
+    return this.addFeature({
+      kind: "biome",
+      name: `${preset.name} ${count}`,
+      points,
+      height: 0,
+      width: 0,
+      rugged: 0,
+      curviness: 0.35,
+      depth: 0,
+      bends: [],
+      biome: key,
+      rainfall: preset.rainfall,
+      humidity: preset.humidity,
+      forest: preset.forest,
+      temp: preset.temp,
+      feather: 40,
+    });
+  }
+
+  /** Start a region from a preset: its climate values are replaced by the preset's. */
+  applyBiomePreset(id: number, key: string): void {
+    const f = this.feature(id);
+    if (!f || f.kind !== "biome") return;
+    const preset = biome(key);
+    const renamed = /^.+ \d+$/.test(f.name) && this.features.some((g) => g === f) ? `${preset.name} ${f.name.match(/(\d+)$/)?.[1] ?? ""}`.trim() : f.name;
+    this.updateFeature(id, { biome: key, rainfall: preset.rainfall, humidity: preset.humidity, forest: preset.forest, temp: preset.temp, name: renamed });
+  }
+
+  /**
+   * Turn what the terrain render planned into ordinary guides the user can
+   * edit: rivers become rivers, hills become low ranges, lakes become water
+   * shapes. The biggest of each come first; `limit` caps how many of each.
+   */
+  adoptPlanned(limit: number): { rivers: number; hills: number; lakes: number } {
+    const plan = this.planned;
+    if (!plan) return { rivers: 0, hills: 0, lakes: 0 };
+    const rivers = plan.rivers.slice(0, limit);
+    const hills = plan.hills.slice(0, limit);
+    const lakes = plan.lakes.slice(0, Math.ceil(limit / 2));
+    let n = this.features.filter((f) => f.kind === "river").length;
+    for (const r of rivers) {
+      this.addFeature({ kind: "river", name: `River ${++n} (planned)`, points: r.points, height: 0, width: Math.min(60, Math.max(0.2, Math.round(0.01 * Math.sqrt(r.flow) * 10) / 10)), rugged: 0, curviness: 0.5, depth: 15 }, false);
+    }
+    n = this.features.filter((f) => f.kind === "mountain").length;
+    for (const h of hills) {
+      this.addFeature({ kind: "mountain", name: `Hills ${++n} (planned)`, points: h.points, height: Math.round(h.height / 10) * 10, width: Math.max(1, Math.round(h.width)), rugged: 0.35, curviness: 0.6, depth: 0 }, false);
+    }
+    for (const l of lakes) {
+      const b = boundingBox(l.points);
+      this.shapes.push({
+        id: this.nextId++,
+        name: `Lake ${this.nextNumber++} (planned)`,
+        kind: "water",
+        // The render's spill level stands on its own hills and cut valleys, so
+        // on the live map it could flood far beyond the outline: the lake
+        // follows the ground instead, sitting in its hollow.
+        height: Math.round(l.level),
+        autoLevel: true,
+        points: l.points,
+        base: { ...DEFAULT_VALUES },
+        adjust: l.points.map(() => ({ ...NO_ADJUSTMENT })),
+        seed: newSeed(),
+        frame: { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2, angle: 0, scale: 1 },
+        hidden: false,
+        locked: false,
+      });
+    }
+    this.planned = null;
+    this.onEdit("shape");
+    this.onEdit("list");
+    this.draw();
+    return { rivers: rivers.length, hills: hills.length, lakes: lakes.length };
+  }
+
+  setPlanned(plan: PlannedFeatures | null): void {
+    this.planned = plan;
+    this.draw();
+  }
+
+  selectFeature(id: number | null): void {
+    this.featureDraft = this.tool === "coast" ? null : this.featureDraft && !this.featureDraft.length ? [] : null;
+    if (id !== null) this.featureDraft = null;
+    this.selection = null;
+    this.referenceSelected = false;
+    this.featureSelected = id;
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  updateFeature(
+    id: number,
+    change: Partial<Pick<PathFeature, "name" | "height" | "width" | "rugged" | "depth" | "curviness" | "bends" | "hidden" | "locked" | "biome" | "rainfall" | "humidity" | "forest" | "temp" | "feather">>,
+  ): void {
+    const f = this.feature(id);
+    if (!f) return;
+    Object.assign(f, change);
+    this.onEdit("shape");
+    this.onEdit("list");
+    this.draw();
+  }
+
+  deleteFeature(id: number): void {
+    this.features = this.features.filter((f) => f.id !== id);
+    if (this.featureSelected === id) this.featureSelected = null;
+    this.onEdit("shape");
+    this.onEdit("list");
+    this.onEdit("selection");
+    this.draw();
+  }
+
+  private hitFeature(p: Vec2): PathFeature | null {
+    const limit = SEGMENT_HIT_PX * this.kmPerPx();
+    let best: PathFeature | null = null;
+    let bestDist = limit;
+    for (const f of this.features) {
+      if (f.hidden || f.locked) continue;
+      const pts = f.kind === "biome" ? [...closedCurve(f.points, f.curviness), f.points[0]] : curvePath(f.points, f.curviness, f.bends);
+      for (let i = 0; i < Math.max(1, pts.length - 1); i++) {
+        const a = pts[i];
+        const b = pts[Math.min(i + 1, pts.length - 1)];
+        const abx = b.x - a.x;
+        const aby = b.y - a.y;
+        const len2 = abx * abx + aby * aby || 1;
+        const t = Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2));
+        const d = Math.hypot(p.x - (a.x + abx * t), p.y - (a.y + aby * t));
+        if (d < bestDist) {
+          best = f;
+          bestDist = d;
+        }
+      }
+    }
+    return best;
+  }
+
+  /** The smallest biome region containing `p` (only with the biome pen, so regions never get in the way of other edits). */
+  private hitRegion(p: Vec2): PathFeature | null {
+    if (this.tool !== "biome") return null;
+    const inside = this.features.filter((f) => f.kind === "biome" && !f.hidden && !f.locked && f.points.length >= 3 && insidePolygon(p, f.points));
+    const area = (f: PathFeature) => {
+      const b = boundingBox(f.points);
+      return (b.x1 - b.x0) * (b.y1 - b.y0);
+    };
+    return inside.sort((a, b) => area(a) - area(b))[0] ?? null;
+  }
+
+  // --- variations and project files ---
+
+  /** New noise for everything that isn't locked: a fresh variation of the same design. */
+  reseed(): void {
+    this.worldSeed = newSeed();
+    for (const s of this.shapes) if (!s.locked) s.seed = newSeed();
+    for (const f of this.features) if (!f.locked) f.seed = newSeed();
+    this.onEdit("shape");
+  }
+
+  /** Everything needed to rebuild the map (the reference image is added by the app). */
+  serialize(): { worldSeed: number; mapWidthKm: number; shapes: ShapeModel[]; features: PathFeature[] } {
+    return structuredClone({ worldSeed: this.worldSeed, mapWidthKm: this.extentKm, shapes: this.shapes, features: this.features });
+  }
+
+  /** Replace the whole map with a saved one. */
+  restore(data: { worldSeed: number; mapWidthKm: number; shapes: ShapeModel[]; features?: PathFeature[] }): void {
+    this.worldSeed = data.worldSeed;
+    this.extentKm = data.mapWidthKm;
+    this.shapes = structuredClone(data.shapes);
+    this.features = structuredClone(data.features ?? []).map((f) => ({
+      ...f,
+      // Files from before curves open straight, exactly as they were drawn.
+      curviness: f.curviness ?? 0,
+      bends: f.bends ?? f.points.slice(1).map(() => 0),
+    }));
+    this.nextId = Math.max(0, ...this.shapes.map((s) => s.id), ...this.features.map((f) => f.id)) + 1;
+    this.nextNumber = this.shapes.length + 1;
+    this.draft = this.shapes.length ? null : [];
+    this.featureDraft = null;
+    this.tool = "coast";
+    this.selection = null;
+    this.featureSelected = null;
+    this.referenceSelected = false;
+    this.onEdit("shape");
+    this.onEdit("list");
+    this.onEdit("selection");
+    this.draw();
   }
 
   // --- commands from the panel ------------------------------------------------------
@@ -270,6 +594,7 @@ export class CoastEditor {
     if (this.draft && this.shapes.length) this.draft = null;
     this.selection = selection;
     this.referenceSelected = false;
+    this.featureSelected = null;
     this.onEdit("selection");
     this.draw();
   }
@@ -288,6 +613,7 @@ export class CoastEditor {
     if (!this.reference) return;
     if (this.draft && this.shapes.length) this.draft = null;
     this.selection = null;
+    this.featureSelected = null;
     this.referenceSelected = true;
     this.onEdit("selection");
     this.draw();
@@ -346,19 +672,38 @@ export class CoastEditor {
     this.onEdit("list");
   }
 
-  /** Make a shape land, water or highland. Default names follow the kind. */
+  /** Make a shape land or water. Default names follow the kind. */
   setKind(id: number, kind: ShapeKindName): void {
     const s = this.shape(id);
     if (!s || s.locked || s.kind === kind) return;
     s.kind = kind;
-    const match = /^(Landmass|Lake|Highland) (\d+)$/.exec(s.name);
+    const match = /^(Landmass|Lake) (\d+)$/.exec(s.name);
     if (match) s.name = `${KIND_NAMES[kind]} ${match[2]}`;
     this.onEdit("shape");
     this.onEdit("selection");
     this.draw();
   }
 
-  /** A highland's height in metres; negative makes a basin. */
+  /** Whether a water shape takes its level from the ground around it. */
+  setAutoLevel(id: number, auto: boolean): void {
+    const s = this.shape(id);
+    if (!s || s.locked) return;
+    s.autoLevel = auto;
+    this.onEdit("shape");
+    this.onEdit("selection");
+  }
+
+  /** Move a shape up or down the stack: where land shapes cross, the later one is on top. */
+  restack(id: number, by: -1 | 1): void {
+    const i = this.shapes.findIndex((s) => s.id === id);
+    const j = i + by;
+    if (i < 0 || j < 0 || j >= this.shapes.length) return;
+    [this.shapes[i], this.shapes[j]] = [this.shapes[j], this.shapes[i]];
+    this.onEdit("shape");
+    this.onEdit("list");
+  }
+
+  /** A shape's height in metres: land surface, or water level. */
   setHeight(id: number, metres: number): void {
     const s = this.shape(id);
     if (!s || s.locked) return;
@@ -396,6 +741,10 @@ export class CoastEditor {
   }
 
   clearAll(): void {
+    this.features = [];
+    this.featureDraft = null;
+    this.featureSelected = null;
+    this.tool = "coast";
     this.shapes = [];
     this.draft = [];
     this.selection = null;
@@ -685,11 +1034,60 @@ export class CoastEditor {
     }
     if (e.button === 2) {
       e.preventDefault();
-      this.startPan(e, this.draft?.length ? "undo-point" : "none");
+      this.startPan(e, this.draft?.length || this.featureDraft?.length ? "undo-point" : "none");
       return;
     }
     if (e.button !== 0) return;
     const p = this.toKm(e);
+
+    // Mountains and rivers: drag a point of the selected one, select one by
+    // clicking its line, or (with that pen active) add points to a new one.
+    const chosen = this.feature(this.featureSelected);
+    if (chosen && !chosen.locked && !chosen.hidden) {
+      for (let i = 0; i < (chosen.kind === "biome" ? 0 : chosen.points.length - 1); i++) {
+        const mid = segmentMiddle(chosen.points, chosen.curviness, chosen.bends, i);
+        if (Math.hypot(mid.at.x - p.x, mid.at.y - p.y) <= HANDLE_HIT_PX * this.kmPerPx()) {
+          this.drag = { kind: "fbend", feature: chosen.id, index: i, from: chosen.bends[i] ?? 0, start: mid.at, normal: mid.normal };
+          this.overlay.setPointerCapture(e.pointerId);
+          return;
+        }
+      }
+      const index = this.hitPoint(p, chosen.points);
+      if (index !== null) {
+        this.drag = { kind: "fpoint", feature: chosen.id, index };
+        this.overlay.setPointerCapture(e.pointerId);
+        return;
+      }
+    }
+    if (!this.featureDraft?.length && !this.draft?.length) {
+      const hit = this.hitFeature(p);
+      if (hit) {
+        this.selectFeature(hit.id);
+        return;
+      }
+      // With the biome pen, a click inside a region selects it; a second click
+      // inside the selected region starts a new one there (regions can nest).
+      const region = this.hitRegion(p);
+      if (region && region.id !== this.featureSelected) {
+        this.selectFeature(region.id);
+        this.featureDraft = [];
+        return;
+      }
+    }
+    if (this.tool !== "coast" && this.featureDraft) {
+      // A biome region closes by clicking its first point.
+      if (this.tool === "biome" && this.featureDraft.length >= 3 && this.hitPoint(p, [this.featureDraft[0]]) === 0) {
+        this.finishFeature();
+        return;
+      }
+      if (this.onMap(p)) {
+        this.featureDraft.push(p);
+        this.featureSelected = null;
+        this.onEdit("selection");
+        this.draw();
+      }
+      return;
+    }
 
     if (this.draft) {
       this.drawPoint(p);
@@ -787,7 +1185,8 @@ export class CoastEditor {
       id: this.nextId++,
       name: `Landmass ${this.nextNumber++}`,
       kind: "land",
-      height: DEFAULT_HIGHLAND_M,
+      height: DEFAULT_LAND_M,
+      autoLevel: true,
       points,
       base: { ...DEFAULT_VALUES },
       adjust: points.map(() => ({ ...NO_ADJUSTMENT })),
@@ -819,7 +1218,20 @@ export class CoastEditor {
     }
     const p = this.toKm(e);
     this.cursor = p;
-    if (drag?.kind === "point") {
+    if (drag?.kind === "fbend") {
+      const f = this.feature(drag.feature);
+      if (f) {
+        // Moving the handle sideways bows the segment by the same amount.
+        f.bends[drag.index] = drag.from + (p.x - drag.start.x) * drag.normal.x + (p.y - drag.start.y) * drag.normal.y;
+        this.onEdit("shape");
+      }
+    } else if (drag?.kind === "fpoint") {
+      const f = this.feature(drag.feature);
+      if (f) {
+        f.points[drag.index] = this.clampToMap(p);
+        this.onEdit("shape");
+      }
+    } else if (drag?.kind === "point") {
       const shape = this.shape(drag.shape);
       if (shape) {
         shape.points[drag.index] = this.clampToMap(p);
@@ -903,21 +1315,31 @@ export class CoastEditor {
     this.drag = null;
     if (this.overlay.hasPointerCapture(e.pointerId)) this.overlay.releasePointerCapture(e.pointerId);
     if (drag.kind === "pan" && !drag.moved) {
-      if (drag.onClick === "undo-point" && this.draft?.length) {
+      if (drag.onClick === "undo-point" && this.featureDraft?.length) {
+        this.featureDraft.pop();
+        this.onEdit("selection");
+      } else if (drag.onClick === "undo-point" && this.draft?.length) {
         this.draft.pop();
         this.onEdit("selection");
-      } else if (drag.onClick === "deselect" && (this.selection || this.referenceSelected)) {
+      } else if (drag.onClick === "deselect" && (this.selection || this.referenceSelected || this.featureSelected !== null)) {
         this.selection = null;
         this.referenceSelected = false;
+        this.featureSelected = null;
         this.onEdit("selection");
       }
     }
-    if (drag.kind === "transform" || drag.kind === "point" || drag.kind === "image") this.onEdit("selection");
+    if (drag.kind !== "pan") this.onEdit("selection");
     this.overlay.style.cursor = this.cursorStyle(e);
     this.draw();
   }
 
   private doubleClick(e: MouseEvent): void {
+    if (this.tool !== "coast" && this.featureDraft?.length) {
+      // The double-click's two clicks each added a point: drop the repeat.
+      if (this.featureDraft.length > 1) this.featureDraft.pop();
+      this.finishFeature();
+      return;
+    }
     if (this.draft) return;
     const p = this.toKm(e);
     const selected = this.selectedShape();
@@ -953,6 +1375,24 @@ export class CoastEditor {
       e.preventDefault();
       return;
     }
+    if (e.key === "Enter" && this.featureDraft?.length) {
+      this.finishFeature();
+      return;
+    }
+    if (e.key === "Escape" && this.tool !== "coast") {
+      if (this.featureDraft?.length) this.featureDraft = [];
+      else this.setTool("coast");
+      this.onEdit("selection");
+      this.draw();
+      return;
+    }
+    if ((e.key === "Backspace" || e.key === "Delete") && this.featureDraft?.length) {
+      this.featureDraft.pop();
+      this.onEdit("selection");
+      this.draw();
+      e.preventDefault();
+      return;
+    }
     if (e.key === "Escape") {
       if (this.draft?.length) {
         this.draft = [];
@@ -962,6 +1402,7 @@ export class CoastEditor {
       } else {
         this.selection = null;
         this.referenceSelected = false;
+        this.featureSelected = null;
         this.onEdit("selection");
       }
       this.draw();
@@ -980,7 +1421,8 @@ export class CoastEditor {
 
   private cursorStyle(e?: PointerEvent): string {
     if (this.drag?.kind === "pan" && this.drag.moved) return "grabbing";
-    if (this.drag?.kind === "point") return "grabbing";
+    if (this.drag?.kind === "point" || this.drag?.kind === "fpoint" || this.drag?.kind === "fbend") return "grabbing";
+    if (this.tool !== "coast" && this.featureDraft) return "crosshair";
     if (this.drag?.kind === "transform" || this.drag?.kind === "image") return this.drag.mode === "move" ? "grabbing" : "crosshair";
     if (this.spaceHeld) return "grab";
     if (this.draft) return this.hover?.kind === "point" ? "pointer" : "crosshair";
@@ -1021,12 +1463,151 @@ export class CoastEditor {
     if (this.reference && !this.reference.hidden) this.drawReference(this.reference);
     if (this.showGrid) this.drawGrid();
     for (const shape of this.shapes) if (!shape.hidden) this.drawShape(shape);
+    for (const f of this.features) if (!f.hidden && f.kind === "biome") this.drawRegion(f.points, f.biome ?? DEFAULT_BIOME, f.id === this.featureSelected, f.locked, f.curviness, false);
+    if (this.planned && this.showPlanned) this.drawPlanned(this.planned);
+    for (const f of this.features) if (!f.hidden && f.kind !== "biome") this.drawFeature(f.points, f.kind as "mountain" | "river", f.id === this.featureSelected, f.locked, f.curviness, f.bends);
+    if (this.featureDraft?.length && this.tool !== "coast") {
+      const pts = this.cursor ? [...this.featureDraft, this.cursor] : this.featureDraft;
+      if (this.tool === "biome") this.drawRegion(pts, DEFAULT_BIOME, true, false, 0, true);
+      else this.drawFeature(pts, this.tool, true, false, DEFAULT_CURVINESS, []);
+    }
     const selected = this.selectedShape();
     if (selected && !selected.hidden && this.selection?.kind === "shape" && !selected.locked) this.drawHandles(selected);
     const ref = this.movableReference();
     if (ref) this.drawImageHandles(ref);
     if (this.draft) this.drawDraft(this.draft);
     this.drawScale();
+  }
+
+  /** A biome region: a tinted, dashed outline. While drawing (`open`), the closing edge isn't filled in yet. */
+  private drawRegion(points: Vec2[], key: string, selected: boolean, locked: boolean, curviness: number, open: boolean): void {
+    const ctx = this.ctx;
+    const preset = biome(key);
+    const outline = (open ? points : closedCurve(points, curviness)).map((p) => this.toPx(p));
+    ctx.lineJoin = "round";
+    if (outline.length >= 3 && !open) {
+      this.path(outline, true);
+      ctx.fillStyle = preset.colour;
+      ctx.globalAlpha = selected ? 0.32 : 0.2;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    if (outline.length > 1) {
+      this.path(outline, !open);
+      ctx.strokeStyle = HALO;
+      ctx.lineWidth = selected ? 5 : 4;
+      ctx.stroke();
+      this.path(outline, !open);
+      ctx.strokeStyle = selected ? HIGHLIGHT : "#f1f5e8";
+      ctx.globalAlpha = locked ? 0.55 : selected ? 1 : 0.85;
+      ctx.lineWidth = selected ? 2 : 1.4;
+      ctx.setLineDash([3, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+    if (!selected) return;
+    points.forEach((v, i) => {
+      const p = this.toPx(v);
+      ctx.beginPath();
+      ctx.rect(p.x - (i === 0 && open ? 5 : 4), p.y - (i === 0 && open ? 5 : 4), i === 0 && open ? 10 : 8, i === 0 && open ? 10 : 8);
+      ctx.fillStyle = i === 0 && open && points.length >= 4 ? HIGHLIGHT : "#ffffff";
+      ctx.strokeStyle = "rgba(10, 20, 28, 0.8)";
+      ctx.lineWidth = 1.5;
+      ctx.fill();
+      ctx.stroke();
+    });
+  }
+
+  /** What the terrain render planned: thin lines, so the user's own guides stay clear. */
+  private drawPlanned(plan: PlannedFeatures): void {
+    const ctx = this.ctx;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    for (const l of plan.lakes) {
+      this.path(l.points.map((p) => this.toPx(p)), true);
+      ctx.strokeStyle = PLANNED_LAKE;
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([2, 3]);
+      ctx.stroke();
+    }
+    for (const h of plan.hills) {
+      this.path(h.points.map((p) => this.toPx(p)), false);
+      ctx.strokeStyle = PLANNED_HILL;
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([5, 4]);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    for (const r of plan.rivers) {
+      this.path(r.points.map((p) => this.toPx(p)), false);
+      ctx.strokeStyle = PLANNED_RIVER;
+      ctx.lineWidth = Math.min(2.5, 0.6 + 0.25 * Math.log10(r.flow + 1));
+      ctx.stroke();
+    }
+    ctx.lineCap = "butt";
+  }
+
+  /** A mountain or river: its line, or a marker for a single point. */
+  private drawFeature(points: Vec2[], kind: "mountain" | "river", selected: boolean, locked: boolean, curviness: number, bends: number[]): void {
+    const ctx = this.ctx;
+    const pts = curvePath(points, curviness, bends).map((p) => this.toPx(p));
+    const marks = points.map((p) => this.toPx(p));
+    const ink = kind === "mountain" ? MOUNTAIN_GUIDE : RIVER_GUIDE;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    if (pts.length > 1) {
+      this.path(pts, false);
+      ctx.strokeStyle = HALO;
+      ctx.lineWidth = selected ? 5 : 4;
+      ctx.stroke();
+      this.path(pts, false);
+      ctx.strokeStyle = ink;
+      ctx.globalAlpha = locked ? 0.55 : selected ? 1 : 0.8;
+      ctx.lineWidth = selected ? 2.25 : 1.5;
+      ctx.setLineDash(kind === "mountain" ? [7, 4] : []);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+    ctx.lineCap = "butt";
+    // Bend handles: grab one to bow its segment sideways.
+    if (selected && !locked && points.length > 1 && points.length === bends.length + 1) {
+      for (let i = 0; i < points.length - 1; i++) {
+        const m = this.toPx(segmentMiddle(points, curviness, bends, i).at);
+        ctx.beginPath();
+        ctx.moveTo(m.x, m.y - 5.5);
+        ctx.lineTo(m.x + 5.5, m.y);
+        ctx.lineTo(m.x, m.y + 5.5);
+        ctx.lineTo(m.x - 5.5, m.y);
+        ctx.closePath();
+        ctx.fillStyle = "#ffffff";
+        ctx.strokeStyle = ink;
+        ctx.lineWidth = 1.75;
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+    marks.forEach((p, i) => {
+      if (marks.length > 1 && !selected) return;
+      if (kind === "mountain") {
+        // A small summit triangle.
+        const r = marks.length === 1 ? 7 : 5;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y - r);
+        ctx.lineTo(p.x + r, p.y + r * 0.8);
+        ctx.lineTo(p.x - r, p.y + r * 0.8);
+        ctx.closePath();
+      } else {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, marks.length === 1 ? 6 : i === 0 ? 5 : 4, 0, Math.PI * 2);
+      }
+      ctx.fillStyle = selected ? ink : "#ffffff";
+      ctx.strokeStyle = "rgba(10, 20, 28, 0.8)";
+      ctx.lineWidth = 1.5;
+      ctx.fill();
+      ctx.stroke();
+    });
   }
 
   private drawReference(ref: ReferenceImage): void {
@@ -1154,7 +1735,7 @@ export class CoastEditor {
     ctx.lineWidth = focused ? 4 : 3;
     ctx.stroke();
     this.path(pts, true);
-    const ink = shape.kind === "water" ? WATER_GUIDE : shape.kind === "highland" ? HIGHLAND_GUIDE : GUIDE;
+    const ink = shape.kind === "water" ? WATER_GUIDE : GUIDE;
     ctx.strokeStyle = ink;
     ctx.globalAlpha = shape.locked ? 0.55 : focused || hovered ? 1 : 0.75;
     ctx.lineWidth = focused ? 1.75 : 1.25;

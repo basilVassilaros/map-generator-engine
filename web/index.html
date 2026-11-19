@@ -15,18 +15,34 @@
       <h1 class="title">World Map Generator</h1>
 
       <nav class="tools">
-        <button class="tool active" aria-pressed="true">
-          <span class="tool-name">Coastline</span>
-          <span class="tool-note">Click point to point</span>
+        <button id="tool-coast" class="tool active" aria-pressed="true">
+          <span class="tool-name">Land and water</span>
+          <span class="tool-note">Shapes, point to point</span>
         </button>
-        <button class="tool" disabled><span class="tool-name">Mountains</span><span class="tool-note">Later sprint</span></button>
-        <button class="tool" disabled><span class="tool-name">Rivers</span><span class="tool-note">Later sprint</span></button>
-        <button class="tool" disabled><span class="tool-name">Biomes</span><span class="tool-note">Later sprint</span></button>
+        <button id="tool-mountain" class="tool" aria-pressed="false">
+          <span class="tool-name">Mountains</span>
+          <span class="tool-note">A point or a line</span>
+        </button>
+        <button id="tool-river" class="tool" aria-pressed="false">
+          <span class="tool-name">Rivers</span>
+          <span class="tool-note">A point or a line</span>
+        </button>
+        <button id="tool-biome" class="tool" aria-pressed="false">
+          <span class="tool-name">Biomes</span>
+          <span class="tool-note">Paint a climate region</span>
+        </button>
         <button class="tool" disabled><span class="tool-name">Population</span><span class="tool-note">Later sprint</span></button>
       </nav>
 
       <div class="actions">
-        <button id="generate" class="primary" disabled>Generate landmass</button>
+        <button id="generate" class="primary" disabled>Generate</button>
+        <button id="render-terrain" class="quiet" disabled>Render terrain…</button>
+        <button id="save-terrain" class="quiet" hidden>Save terrain image</button>
+        <div id="planned-box" class="planned" hidden>
+          <label class="check"><input id="show-planned" type="checkbox" checked> Show planned rivers, hills and lakes</label>
+          <button id="keep-planned" class="quiet">Keep them as guides</button>
+          <p id="planned-facts" class="hint"></p>
+        </div>
         <button id="clear" class="quiet" disabled>Clear all shapes</button>
         <button id="export" class="quiet" disabled>Export PNG…</button>
         <p id="export-status" class="hint" aria-live="polite"></p>
@@ -53,8 +69,8 @@
           <button id="new-shape" class="small">New shape</button>
         </div>
         <ul id="shape-list" class="shape-list" aria-label="Coastline shapes"></ul>
-        <button id="import-image" class="link-btn">Import an image to trace…</button>
-        <input id="import-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml" hidden>
+        <button id="import-image" class="link-btn">Import a project or an image to trace…</button>
+        <input id="import-file" type="file" accept=".json,.wmap,application/json,image/png,image/jpeg,image/webp,image/gif,image/svg+xml" hidden>
         <p id="guidance" class="guidance" aria-live="polite"></p>
       </section>
 
@@ -69,14 +85,22 @@
           <div class="segmented" role="group" aria-labelledby="kind-label">
             <button id="kind-land" aria-pressed="true">Land</button>
             <button id="kind-water" aria-pressed="false">Water</button>
-            <button id="kind-highland" aria-pressed="false">Highland</button>
           </div>
           <p id="kind-hint" class="hint"></p>
         </div>
-        <div id="height-field" class="field" hidden>
-          <div class="field-head"><label for="height">Height</label><output id="height-value"></output></div>
-          <input id="height" type="range" min="-2000" max="4000" step="50">
-          <p class="hint">How far the highland rises above the land around it. Negative heights make a basin.</p>
+        <div id="height-field" class="field">
+          <div class="field-head"><label id="height-label" for="height">Height</label><output id="height-value"></output></div>
+          <input id="height" type="range" min="-500" max="5000" step="25">
+          <label id="auto-level-row" class="check"><input id="auto-level" type="checkbox"> Match the ground around it</label>
+          <p id="height-hint" class="hint"></p>
+        </div>
+        <div class="field">
+          <div class="field-head"><span>Stacking</span></div>
+          <div class="button-row">
+            <button id="stack-up" class="small">Move up</button>
+            <button id="stack-down" class="small">Move down</button>
+          </div>
+          <p class="hint">Where land shapes cross, the one lower in the list is on top.</p>
         </div>
         <h3 class="subhead">Coastline, all segments</h3>
         <p class="hint subhead-hint">Changes every segment. Segments you've adjusted keep their own difference on top.</p>
@@ -84,6 +108,74 @@
         <p id="shape-facts" class="hint"></p>
         <p id="shape-help" class="hint"></p>
         <button id="delete-shape" class="quiet danger">Delete shape</button>
+      </section>
+
+      <section id="feature-panel" class="block" hidden>
+        <h2 id="feature-title">Mountain</h2>
+        <div class="field">
+          <div class="field-head"><label for="feature-name">Name</label></div>
+          <input id="feature-name" type="text" maxlength="60" autocomplete="off">
+        </div>
+        <div id="f-height-field" class="field">
+          <div class="field-head"><label for="f-height">Summit height</label><output id="f-height-value"></output></div>
+          <input id="f-height" type="range" min="200" max="8000" step="100">
+        </div>
+        <div class="field">
+          <div class="field-head"><label id="f-width-label" for="f-width">Width</label><output id="f-width-value"></output></div>
+          <input id="f-width" type="range" min="1" max="200" step="1">
+          <p id="f-width-hint" class="hint"></p>
+        </div>
+        <div id="f-curve-field" class="field">
+          <div class="field-head"><label for="f-curve">Curviness</label><output id="f-curve-value"></output></div>
+          <input id="f-curve" type="range" min="0" max="100" step="1">
+          <p class="hint">Straight segments at 0, a smooth curve through your points at 100. Drag the diamond on a segment to bow just that stretch.</p>
+          <button id="f-reset-bends" class="quiet">Straighten bows</button>
+        </div>
+        <div id="f-rugged-field" class="field">
+          <div class="field-head"><label for="f-rugged">Ruggedness</label><output id="f-rugged-value"></output></div>
+          <input id="f-rugged" type="range" min="0" max="100" step="1">
+          <p class="hint">Smooth domes at 0, jagged ridges and spurs at 100.</p>
+        </div>
+        <div id="f-depth-field" class="field">
+          <div class="field-head"><label for="f-depth">Channel depth</label><output id="f-depth-value"></output></div>
+          <input id="f-depth" type="range" min="2" max="300" step="1">
+          <p class="hint">How deep the river cuts below its banks. Deeper channels make wider valleys.</p>
+        </div>
+        <div id="biome-fields" hidden>
+          <div class="field">
+            <div class="field-head"><label for="b-preset">Biome</label></div>
+            <select id="b-preset"></select>
+            <p id="b-note" class="hint"></p>
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="b-rain">Rainfall</label><output id="b-rain-value"></output></div>
+            <input id="b-rain" type="range" min="0" max="4000" step="10">
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="b-humid">Humidity</label><output id="b-humid-value"></output></div>
+            <input id="b-humid" type="range" min="0" max="100" step="1">
+            <p class="hint">Dry air makes the same rain go less far for plants, so the land browns at low humidity.</p>
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="b-forest">Forest cover</label><output id="b-forest-value"></output></div>
+            <input id="b-forest" type="range" min="0" max="100" step="1">
+            <p class="hint">How much of the ground is under trees. Woods grow in clumps; this sets how much they cover.</p>
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="b-temp">Temperature at sea level</label><output id="b-temp-value"></output></div>
+            <input id="b-temp" type="range" min="-25" max="32" step="1">
+            <label class="check"><input id="b-temp-auto" type="checkbox"> Follow the latitude</label>
+            <p class="hint">Mountains inside the region are still colder with height.</p>
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="b-feather">Soft edge</label><output id="b-feather-value"></output></div>
+            <input id="b-feather" type="range" min="0" max="300" step="5">
+            <p class="hint">How far the region blends into the country around it.</p>
+          </div>
+          <button id="b-regen" class="primary">Regenerate terrain</button>
+        </div>
+        <p id="feature-help" class="hint"></p>
+        <button id="delete-feature" class="quiet danger">Delete</button>
       </section>
 
       <section id="reference-panel" class="block" hidden>
@@ -157,6 +249,41 @@
           <input id="smoothing" type="range" min="0" max="3" step="0.25" value="1">
           <p class="hint">Anti-aliasing for coastlines: softens jagged pixel edges on the map and in exports.</p>
         </div>
+        <div class="field">
+          <div class="field-head"><label for="terrain-look">Terrain look</label></div>
+          <select id="terrain-look">
+            <option value="0" selected>True colour (satellite)</option>
+            <option value="1">Vivid</option>
+            <option value="2">Atlas</option>
+          </select>
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="terrain-detail">Terrain detail</label></div>
+          <select id="terrain-detail">
+            <option value="quick" selected>Quick (working resolution)</option>
+            <option value="map-2048">Whole map, 2048 px</option>
+            <option value="map-4096">Whole map, 4096 px</option>
+            <option value="view-2048">This view only, 2048 px</option>
+            <option value="view-4096">This view only, 4096 px</option>
+          </select>
+          <p class="hint">Higher detail adds relief, true-width rivers and satellite texture, and can be zoomed. "This view only" renders just what's on screen, at the finest detail.</p>
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="latitude">Latitude of the map's centre</label></div>
+          <div class="inline-input">
+            <input id="latitude" type="number" min="-85" max="85" step="1" value="35" inputmode="numeric">
+            <span>° north (negative for south)</span>
+          </div>
+          <p class="hint">Sets temperature and the prevailing winds for the terrain render.</p>
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="rainfall">Average rainfall</label></div>
+          <div class="inline-input"><input id="rainfall" type="number" min="50" max="4000" step="50" value="800" inputmode="numeric"><span>mm a year</span></div>
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="evaporation">Evaporation from lakes</label></div>
+          <div class="inline-input"><input id="evaporation" type="number" min="0" max="4000" step="50" value="900" inputmode="numeric"><span>mm a year</span></div>
+        </div>
         <p id="map-facts" class="hint"></p>
         <p class="hint">Scroll or pinch to zoom; zoomed views are regenerated at full detail. Drag empty map, or hold Space and drag, to pan.</p>
       </section>
@@ -178,6 +305,18 @@
         <input type="radio" name="export-mode" value="full">
         <span><span class="choice-name">Full detail</span><span class="hint">The whole map regenerated at high resolution, with the same detail you see when zoomed in.</span></span>
       </label>
+      <label class="choice">
+        <input type="radio" name="export-mode" value="terrain">
+        <span><span class="choice-name">Terrain image, full detail</span><span id="terrain-export-hint" class="hint">The rendered terrain at the detail you see fully zoomed in: relief, rivers and satellite texture down to the pixel.</span></span>
+      </label>
+      <label class="choice">
+        <input type="radio" name="export-mode" value="heightmap">
+        <span><span class="choice-name">Heightmap, 16-bit</span><span id="heightmap-export-hint" class="hint">Greyscale PNG of the rendered terrain's ground height, for Unreal Engine and other tools.</span></span>
+      </label>
+      <label class="choice">
+        <input type="radio" name="export-mode" value="project">
+        <span><span class="choice-name">Project file</span><span class="hint">Saves the map you're working on, with every shape and setting, so you can open it again with Import.</span></span>
+      </label>
     </div>
     <div id="full-options" class="field" hidden>
       <div class="field-head"><label for="full-size">Size</label></div>
@@ -188,6 +327,16 @@
       </select>
       <p id="full-estimate" class="hint"></p>
     </div>
+    <div id="terrain-options" class="field" hidden>
+      <div class="field-head"><label for="terrain-area">Area</label></div>
+      <select id="terrain-area">
+        <option value="map" selected>Whole map</option>
+        <option value="view">This view only</option>
+      </select>
+      <div class="field-head"><label for="terrain-size">Size</label></div>
+      <select id="terrain-size"></select>
+      <p id="terrain-estimate" class="hint"></p>
+    </div>
     <div id="export-progress" hidden>
       <progress id="export-bar" max="1" value="0"></progress>
       <p id="export-progress-text" class="hint" aria-live="polite"></p>
@@ -195,6 +344,16 @@
     <div class="dialog-actions">
       <button id="export-cancel" class="quiet">Cancel</button>
       <button id="export-go" class="primary">Export</button>
+    </div>
+  </dialog>
+  <dialog id="terrain-dialog" class="export-dialog" aria-labelledby="terrain-title">
+    <h2 id="terrain-title">Render terrain</h2>
+    <p>This works out the climate, lets rain run from the mountains to the sea, cuts valleys, fills lakes and colours the land by its biome. It runs on your computer and replaces the map's picture until you next change something.</p>
+    <p class="hint">It needs a reasonably recent computer: about 2 to 4 seconds at 1024 working resolution and 10 to 20 seconds at 2048, with around 1 GB of free memory at 2048. Older or low-powered devices will take longer. Your map isn't changed, and you can keep editing afterwards.</p>
+    <label class="check"><input id="terrain-skip" type="checkbox"> Don't show this again</label>
+    <div class="dialog-actions">
+      <button id="terrain-cancel" class="quiet">Cancel</button>
+      <button id="terrain-go" class="primary">Render</button>
     </div>
   </dialog>
   <script><!-- SCRIPT --></script>

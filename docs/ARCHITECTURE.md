@@ -75,6 +75,113 @@ lazily, only near the coast, since cells far inland or out at sea never use it.
 Hidden shapes are simply left out of the guides. Locking is purely an
 editor feature.
 
+## Two tiers, and the terrain render
+
+**Tier 1, the ground,** is local: every cell depends only on nearby shapes
+and mountains, so edits recompute just what they reach, exactly. Land shapes
+set the ground's height in stacking order, each stepping from whatever was
+there to its own height across its edge. Mountains add their height on top.
+
+**Tier 2** covers the whole map after every edit, because it depends on what
+connects to what: drawn rivers carve their channels (the water surface along
+a river never rises), and land below the surface of water it touches floods,
+spreading cell to cell. The engine counts land lying below its nearest water;
+while that count is zero the flood pass is skipped entirely. Tier 2 remembers
+which cells it changed, puts them back, and reruns from the tier 1 ground,
+so the result is always a pure function of the guides.
+
+**The terrain render** (`core/src/hydro.rs`) is a slower pass run on request:
+
+1. *Climate.* Temperature from latitude, less 6.5 °C per km of height.
+   Winds by circulation cell: trade winds within 30° of the equator,
+   westerlies from 30° to 60°, polar easterlies beyond, with dry belts near
+   30°. Air gains moisture over water, loses it over land, fastest when
+   forced up a slope, and descends dry: a rain shadow.
+2. *Drainage.* Priority flood fills every hollow to its spill point and
+   gives each cell a downhill route; rain is accumulated along the routes.
+3. *Erosion.* The stream power law: incision grows with discharge and slope.
+   Downstream cells are settled first, which keeps it stable.
+4. *Lakes and rivers.* Hollows that still hold water after evaporation are
+   lakes; cells carrying enough water are rivers.
+5. *Biomes.* Colour from temperature and rainfall, after Whittaker.
+
+It runs on the CPU with fixed arithmetic, so it's repeatable everywhere.
+
+## Curves
+
+Mountain ranges and rivers follow a *curve* through their points: a
+centripetal Catmull-Rom spline blended with the straight line by
+**curviness**, plus an optional sideways **bend** per segment
+(`features::curve_path`). It is sampled every ~6 km regardless of resolution,
+so the same line results at every zoom and in strips. The browser has a
+mirror of the function (`curve.ts`) so the drawn line matches the core's.
+
+## The terrain render in two stages
+
+**Stage A** (`hydro::render`) is the render described above, on the working
+grid. It also leaves a **structure** (`fine::Structure`): the height changes
+(plains undulation and valley cutting), rain, where hollow lakes and floods
+stand, and the drainage network as smooth curves (each river cell's channel
+runs from the midpoint with the cell upstream, through its centre, to the
+midpoint downstream, so tributaries merge into continuous curves).
+
+Before shaping anything, stage A **plans** the land as vectors (`plan.rs`),
+the same kind of lines and outlines the user draws:
+
+1. **Drawn rivers** are resampled every few hundred metres and swung from
+   side to side: meanders about twelve channel widths long with an uneven
+   rhythm, on broader swings, fading to nothing at source and mouth so the
+   river still starts and ends where it was drawn. The channel is set into
+   the ground and only ever descends; the river carries its own flow (from its
+   width) besides everything that drains into it. In the live map a drawn
+   river is fixed water; in the render it is part of the drainage.
+2. **Biome regions** replace the climate inside them, blending across a soft
+   edge: rainfall, a temperature offset (so height still cools the air),
+   humidity and tree cover, all passed to stage B.
+3. **Hills** stand on the divides between rivers: the cells furthest from any
+   river (a chamfer distance transform) chained into lines, skipping ground a
+   drawn range already covers. Their height and width grow with how far they
+   are from water. They are added to the ground before erosion.
+4. Steep ground is **roughened** in proportion to its slope, so water
+   gathers into branching valleys instead of running down parallel gullies.
+5. After erosion, the larger **rivers are traced** source to mouth (each
+   tributary ending on the river it joins) and **lake outlines** are traced
+   round the hollows that hold water; both are simplified to editable guides.
+
+**Stage B** (`fine::render_fine`) renders any window onto the world at any
+resolution from that structure. It builds the ground from the guides at the
+window's own resolution (shapes, mountains, drawn rivers, with detail down to
+the pixel), adds the structure's height changes, fractal relief, lake and
+flood contours that follow the real fine ground, and rivers at their true
+width through a gentle warp so they wander. Colour comes from `look.rs`:
+land-cover texture (with woods in clumps where a biome region sets the tree
+cover, and humidity changing how far the rain goes), slope and rock, a ragged snow line, wetlands and green
+banks, beaches, water depth, sediment plumes, hillshade and ambient occlusion.
+
+Mountainsides follow their drainage: every stream down to a few cells'
+worth of rain is in the structure, and the ground rises from each stream in a
+V that rounds off towards the crest, so ridges and spurs stand between the
+gullies. A stream's handicap shrinks with its size, so big rivers cut deeper
+valleys than rills, and taking the lowest score over nearby streams keeps the
+ground continuous where the nearest stream changes. The structure's height
+changes are sampled with a cubic B-spline, so no grid lines show however far
+the view is zoomed.
+
+Stage B also returns the **ground height** of each pixel (under water too),
+which the browser writes into **16-bit heightmaps**, and the same strips feed
+the **full-detail terrain export**: strips finish in any order on several
+workers and are written into the PNG in order, so images far larger than a
+canvas (up to 16384 px) stream to the file with modest memory.
+
+Stage B never moves what stage A decided, and depends only on world position
+and the structure, so a window cut into strips renders identically to one cut
+whole (tested). The browser therefore renders strips in parallel workers,
+each sent the structure once, and paints them as they arrive.
+
+**Three engines run side by side:** the full-resolution map, a
+half-resolution preview (a quarter of the work, shown enlarged until the
+full result lands), and the zoomed detail view.
+
 ## Zoom: two cores, one world
 
 The browser runs two copies of the core, each in its own background thread.
@@ -150,5 +257,10 @@ noise frame, so its coastline noise is recomputed. The outline on screen always 
 the mouse immediately; at 2048 the terrain trails slightly behind.
 
 A zoomed view takes about 1 to 1.5 s to sharpen after the view stops moving.
+
+Terrain render (core only, one thread, 1024 working resolution): stage A
+about 3 s; stage B about 7 s for the whole map at 2048 px, 3 s for a
+1024 px section. In headless Firefox with workers, a 2048 px whole-map detail
+render took about 4 s and a view-only 2048 px render about 5 s.
 A full-detail export at 4096 pixels took about 11 s in headless Firefox here;
 time grows with the square of the size.

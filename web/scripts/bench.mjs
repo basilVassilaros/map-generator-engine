@@ -20,7 +20,8 @@ const shapes = [island(1, 500, 500, 320), island(2, 1150, 650, 280), island(3, 8
 
 function send() {
   const data = [7, 1, shapes.length];
-  for (const s of shapes) data.push(s.id, s.seed, ...s.frame, 0, 0, s.points.length, ...s.points.flat(), ...s.params.flat());
+  for (const s of shapes) data.push(s.id, s.seed, ...s.frame, 0, 300, s.points.length, ...s.points.flat(), ...s.params.flat());
+  data.push(0, 0); // no mountains, no rivers
   const ptr = core.wm_inbox(data.length);
   new Float32Array(core.memory.buffer, ptr, data.length).set(data);
   const t = performance.now();
